@@ -1,0 +1,117 @@
+name: Render cartoon
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CND_DIR: ${{ github.workspace }}/cnd
+
+jobs:
+  render:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    env:
+      SHARD: ${{ matrix.shard }}
+      SHARDS: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libnss3 libdbus-1-3 libatk1.0-0 libgbm-dev \
+            libasound2 libxrandr2 libxkbcommon-dev libxfixes3 libxcomposite1 \
+            libxdamage1 libatk-bridge2.0-0 libpango-1.0-0 libcairo2 libcups2
+
+      - run: pip install numpy
+
+      - name: Restore node_modules
+        id: nm
+        uses: actions/cache/restore@v4
+        with:
+          path: cnd/remotion_project/node_modules
+          key: nm-v1
+
+      - name: Render this shard
+        run: python cartoon.py
+
+      - name: Save node_modules
+        if: always() && steps.nm.outputs.cache-hit != 'true' && hashFiles('cnd/remotion_project/node_modules/remotion/package.json') != ''
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: cnd/remotion_project/node_modules
+          key: nm-v1
+
+      - name: Upload chunks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunks-${{ matrix.shard }}
+          path: cnd/render_cache
+          if-no-files-found: ignore
+          retention-days: 3
+          compression-level: 0
+
+  join:
+    needs: render
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg libnss3 libdbus-1-3 libatk1.0-0 libgbm-dev \
+            libasound2 libxrandr2 libxkbcommon-dev libxfixes3 libxcomposite1 \
+            libxdamage1 libatk-bridge2.0-0 libpango-1.0-0 libcairo2 libcups2
+
+      - run: pip install numpy
+
+      - name: Restore node_modules
+        uses: actions/cache/restore@v4
+        with:
+          path: cnd/remotion_project/node_modules
+          key: nm-v1
+
+      - name: Download all chunks
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chunks-*
+          merge-multiple: true
+          path: cnd/render_cache
+
+      - name: Join chunks with audio
+        run: python cartoon.py
+
+      - name: Upload final video
+        uses: actions/upload-artifact@v4
+        with:
+          name: cartoon_60fps
+          path: cnd/cartoon_60fps.mp4
+          retention-days: 14
+          compression-level: 0
