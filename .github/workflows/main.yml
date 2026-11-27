@@ -38,7 +38,8 @@ jobs:
             libasound2 libxrandr2 libxkbcommon-dev libxfixes3 libxcomposite1 \
             libxdamage1 libatk-bridge2.0-0 libpango-1.0-0 libcairo2 libcups2
 
-      - run: pip install numpy
+      - name: Python dependencies
+        run: pip install numpy
 
       - name: Restore node_modules
         id: nm
@@ -48,7 +49,7 @@ jobs:
           key: nm-v1
 
       - name: Render this shard
-        run: python cartoon.py
+        run: python "python cartoon.py"
 
       - name: Save node_modules
         if: always() && steps.nm.outputs.cache-hit != 'true' && hashFiles('cnd/remotion_project/node_modules/remotion/package.json') != ''
@@ -90,7 +91,8 @@ jobs:
             libasound2 libxrandr2 libxkbcommon-dev libxfixes3 libxcomposite1 \
             libxdamage1 libatk-bridge2.0-0 libpango-1.0-0 libcairo2 libcups2
 
-      - run: pip install numpy
+      - name: Python dependencies
+        run: pip install numpy
 
       - name: Restore node_modules
         uses: actions/cache/restore@v4
@@ -106,7 +108,7 @@ jobs:
           path: cnd/render_cache
 
       - name: Join chunks with audio
-        run: python cartoon.py
+        run: python "python cartoon.py"
 
       - name: Upload final video
         uses: actions/upload-artifact@v4
