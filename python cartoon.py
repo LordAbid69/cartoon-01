@@ -1,729 +1,458 @@
 #!/usr/bin/env python3
-# Setup:  pip install numpy      (also needs Node.js 18+ with npm; internet on first run)
-# Run:    python make_cartoon.py
-# Output: C:\Users\laptop villa\Documents\cnd\cartoon_60fps.mp4
-import os, sys, re, json, math, shutil, subprocess, time, wave, hashlib
-from pathlib import Path
-import numpy as np
-
-DIR = Path(os.environ.get("CND_DIR", r"C:\Users\laptop villa\Documents\cnd"))
-AUDIO = DIR / "20204.mp3"
-PROJ = DIR / "remotion_project"
-OUT = DIR / "cartoon_60fps.mp4"
-FPS, SR = 60, 44100
-SCARE = 180        # jumpscare length in frames (3.0 s) appended after the narration
-SFX_LEVEL = .28    # sound effects vs voice (lower = quieter effects)
-CHUNK = 120        # frames per saved render chunk (2 s)
-PREP = "--prep" in sys.argv          # build + analyse + mix only (no npm/render)
-
-STAGES = [("Setup & checks", 2), ("Write Remotion project", 3), ("Install Remotion (npm)", 15),
-          ("Analyse audio / sync map", 8), ("Sound design & mix", 10), ("Render 1080x1920 @60fps", 62)]
-
-
-class Prog:
-    def start(self, i):
-        self.i, self.base, self.t0 = i, sum(w for _, w in STAGES[:i]), time.time()
-        self.line(0)
-
-    def line(self, frac, msg=""):
-        tot = self.base + STAGES[self.i][1] * frac
-        n = int(30 * tot / 100)
-        print(f"\r[{self.i+1}/{len(STAGES)}] {STAGES[self.i][0]:<26}[{'#'*n}{'-'*(30-n)}] {tot:5.1f}%  {msg:<38}", end="", flush=True)
-
-    def done(self, msg=""):
-        self.line(1, msg or f"done in {time.time()-self.t0:.1f}s")
-        print()
-
-
-P = Prog()
-
-
-def run(cmd, cwd=None):
-    r = subprocess.run([str(c) for c in cmd], cwd=cwd, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    if r.returncode:
-        sys.exit(f"\nFAILED: {' '.join(map(str, cmd))}\n{r.stdout[-1500:]}\n{r.stderr[-1500:]}")
-    return r
-
-
-# ----------------------------------------------------------------------------- JSX sources
-ART = r'''import React from 'react';
-export const C={ink:'#3b2a1f',wall:'#eadcb9',wall2:'#dccb9e',floor:'#b78f60',floor2:'#a27a4f',wood:'#8b5b3a',wood2:'#6f4528',yel:'#f2dc86',grn:'#a4ba8b',grn2:'#7e9a6b',skin:'#d9a273',skin2:'#c48b5b',cream:'#fff8e8',pee:'#f0d230',red:'#cf6a49',dark:'#4c3426',tan:'#c9a06a'};
-const K=C.ink;
-export const clamp=(v,a=0,b=1)=>Math.min(b,Math.max(a,v));
-export const ease=p=>1-Math.pow(1-clamp(p),3);
-export const seg=(u,a,b)=>clamp((u-a)/(b-a));
-export const lerp=(a,b,p)=>a+(b-a)*p;
-export const back=p=>{p=clamp(p);const c=1.9;return 1+(c+1)*Math.pow(p-1,3)+c*Math.pow(p-1,2);};
-const rad=d=>d*Math.PI/180;
-const endPt=(s,deg,len)=>[s[0]+len*Math.sin(rad(deg)),s[1]+len*Math.cos(rad(deg))];
-const Limb=({a,b,bend=0,w=34,col})=>{const mx=(a[0]+b[0])/2,my=(a[1]+b[1])/2,dx=b[0]-a[0],dy=b[1]-a[1];const d=`M${a[0]} ${a[1]} Q${mx-dy*bend} ${my+dx*bend} ${b[0]} ${b[1]}`;return(<g fill="none" strokeLinecap="round"><path d={d} stroke={K} strokeWidth={w+12}/><path d={d} stroke={col} strokeWidth={w}/></g>);};
-const Hand=({p,col})=><circle cx={p[0]} cy={p[1]} r={25} fill={col} stroke={K} strokeWidth={7}/>;
-
-const EX={
- angry:{eye:'open',h:.7,br:[24,-24],bro:-2,m:'M-48 90 Q0 34 48 90',fill:false,blush:C.red},
- sneaky:{eye:'half',h:.55,br:[-8,20],bro:-6,m:'M-44 74 Q8 106 54 54',fill:false},
- innocent:{eye:'open',h:1.1,br:[-24,24],bro:-14,m:'M-14 78 a14 18 0 1 0 28 0 a14 18 0 1 0 -28 0',fill:true},
- relief:{eye:'closed',h:0,br:[-12,12],bro:-8,m:'M-54 62 Q0 128 54 62 Z',fill:true,blush:C.red},
- grin:{eye:'open',h:.95,br:[-14,14],bro:-10,m:'M-62 64 Q0 126 62 64 Z',fill:true,teeth:true},
- shock:{eye:'open',h:1.35,br:[-26,26],bro:-22,m:'M-22 70 a22 34 0 1 0 44 0 a22 34 0 1 0 -44 0',fill:true},
- flat:{eye:'half',h:.6,br:[8,-8],bro:0,m:'M-40 86 L40 86',fill:false},
- gross:{eye:'closed',h:0,br:[22,-22],bro:0,m:'M-50 98 Q-25 60 0 92 Q25 60 50 98',fill:false},
-};
-const Face=({ex,look,blink,sniff,skin})=>{
- const e=EX[ex]||EX.flat;const h=Math.max(.04,e.h*(1-blink));
- return(<g>
-  {e.blush&&[-82,82].map(x=><circle key={x} cx={x} cy={46} r={21} fill={e.blush} opacity={.55}/>)}
-  {[-48,48].map((x,i)=>e.eye==='closed'
-   ?<path key={i} d={`M${x-30} 2 Q${x} -30 ${x+30} 2`} fill="none" stroke={K} strokeWidth={8} strokeLinecap="round"/>
-   :<g key={i}>
-     <ellipse cx={x} cy={-8} rx={36} ry={40*h} fill={C.cream} stroke={K} strokeWidth={6}/>
-     <circle cx={x+look[0]*12} cy={-8+look[1]*10} r={14} fill={K}/>
-     <circle cx={x+look[0]*12+5} cy={-8+look[1]*10-5} r={4} fill={C.cream}/>
-     {e.eye==='half'&&<g><path d={`M${x-40} ${-8-40*h-4} H${x+40} V-9 H${x-40}Z`} fill={skin}/><line x1={x-38} x2={x+38} y1={-9} y2={-9} stroke={K} strokeWidth={7} strokeLinecap="round"/></g>}
-    </g>)}
-  {[-48,48].map((x,i)=><line key={i} transform={`translate(${x} ${-62+e.bro}) rotate(${e.br[i]})`} x1={-34} x2={34} y1={0} y2={0} stroke={K} strokeWidth={12} strokeLinecap="round"/>)}
-  <g transform={`translate(0 30) scale(${1+sniff*.7})`}><path d="M-8 -6 Q14 10 -8 18" fill="none" stroke={K} strokeWidth={6} strokeLinecap="round"/></g>
-  <path d={e.m} fill={e.fill?'#7b2f2b':'none'} stroke={K} strokeWidth={7} strokeLinejoin="round" strokeLinecap="round"/>
-  {e.teeth&&<g><path d="M-56 67 H56 L50 83 H-50Z" fill={C.cream}/><line x1={0} x2={0} y1={67} y2={83} stroke={K} strokeWidth={4}/></g>}
- </g>);
-};
-const Head=({skin,ex,look,blink,sniff,rot=0,mom})=>(
- <g transform={`rotate(${rot})`}>
-  {[-1,1].map(s=><circle key={s} cx={s*124} cy={8} r={28} fill={skin} stroke={K} strokeWidth={7}/>)}
-  {mom&&<circle cx={0} cy={-150} r={52} fill={K}/>}
-  <circle r={125} fill={skin} stroke={K} strokeWidth={8}/>
-  <path d={mom?"M-122 -30 Q-120 -150 0 -140 Q120 -150 122 -30 Q70 -105 0 -98 Q-70 -105 -122 -30Z":"M-118 -40 Q-110 -150 0 -135 Q110 -150 118 -40 Q80 -95 0 -88 Q-80 -95 -118 -40Z"} fill={K}/>
-  {!mom&&<path d="M-8 -130 Q4 -178 30 -152" fill="none" stroke={K} strokeWidth={9} strokeLinecap="round"/>}
-  {mom&&<g><circle cx={0} cy={-84} r={7} fill={C.red}/>{[-1,1].map(s=><circle key={s} cx={s*126} cy={44} r={9} fill="#d9b44a" stroke={K} strokeWidth={4}/>)}</g>}
-  <Face ex={ex} look={look} blink={blink} sniff={sniff} skin={skin}/>
- </g>);
-
-export const Sweat=({x,y,t})=>{const p=(t*.9)%1;return <path transform={`translate(${x} ${y+p*50})`} d="M0 -26 Q22 6 0 24 Q-22 6 0 -26Z" fill="#a9d4e6" stroke={K} strokeWidth={5} opacity={1-p*.6}/>;};
-
-export const Kid=({x,y,s=1,t=0,ex='flat',look=[0,0],walk=0,aL=-15,aR=15,squash=0,rot=0,blink=0,sniff=0,lift=0,sweat=0,children})=>{
- const sw=Math.sin(walk),bob=walk?-Math.abs(sw)*14:0;
- const sL=[-80,-300+bob],sR=[80,-300+bob],eL=endPt(sL,aL,150),eR=endPt(sR,aR,150);
- return(<g transform={`translate(${x} ${y-lift}) scale(${s*(1+.08*squash)} ${s*(1-.12*squash)})`}>
-  <ellipse cx={0} cy={lift/s} rx={115} ry={22} fill={C.dark} opacity={.22}/>
-  <Limb a={[-38,-110]} b={[-38+sw*26,-16]} w={30} col={C.skin}/><Limb a={[38,-110]} b={[38-sw*26,-16]} w={30} col={C.skin}/>
-  {[[-38+sw*26,-16],[38-sw*26,-16]].map((p,i)=><ellipse key={i} cx={p[0]+8} cy={p[1]+6} rx={34} ry={15} fill={C.dark} stroke={K} strokeWidth={6}/>)}
-  <path d="M-90 -140 L90 -140 L84 -80 L8 -80 L0 -100 L-8 -80 L-84 -80Z" fill={C.grn2} stroke={K} strokeWidth={7} strokeLinejoin="round"/>
-  <path d="M-84 -340 Q0 -364 84 -340 L92 -130 Q0 -112 -92 -130Z" fill={C.yel} stroke={K} strokeWidth={7} strokeLinejoin="round"/>
-  <Limb a={sL} b={eL} bend={.12} w={28} col={C.skin}/><Hand p={eL} col={C.skin}/>
-  <Limb a={sR} b={eR} bend={-.12} w={28} col={C.skin}/><Hand p={eR} col={C.skin}/>
-  <g transform={`translate(0 ${-455+bob})`}><Head skin={C.skin} ex={ex} look={look} blink={blink} sniff={sniff} rot={rot}/></g>
-  {sweat>0&&<Sweat x={118} y={-540+bob} t={t}/>}
-  {children}
- </g>);
-};
-
-export const Mom=({x,y,s=1,t=0,ex='flat',look=[0,0],walk=0,aL=-30,aR=40,rot=0,blink=0,sniff=0,tint=0,children})=>{
- const sw=Math.sin(walk),bob=walk?-Math.abs(sw)*10:0,skin=tint?'#b9c48a':C.skin2;
- const sL=[-88,-325+bob],sR=[88,-325+bob],eL=endPt(sL,aL,170),eR=endPt(sR,aR,170);
- return(<g transform={`translate(${x} ${y}) scale(${s})`}>
-  <ellipse cx={0} cy={4} rx={150} ry={24} fill={C.dark} opacity={.22}/>
-  {[-48,48].map((p,i)=><ellipse key={i} cx={p+(i?1:-1)*sw*8} cy={-8} rx={36} ry={15} fill={C.dark} stroke={K} strokeWidth={6}/>)}
-  <path d="M-90 -350 Q0 -375 90 -350 L132 -30 Q0 -6 -132 -30Z" fill={C.grn2} stroke={K} strokeWidth={7} strokeLinejoin="round"/>
-  <path d="M-128 -54 Q0 -32 128 -54 L132 -30 Q0 -6 -132 -30Z" fill={C.wood} stroke={K} strokeWidth={6}/>
-  <path d="M-90 -350 L-38 -352 L112 -150 L62 -120Z" fill={C.grn} stroke={K} strokeWidth={6} strokeLinejoin="round"/>
-  <path d="M-90 -350 Q0 -375 90 -350 L84 -296 Q0 -274 -84 -296Z" fill={C.yel} stroke={K} strokeWidth={6} strokeLinejoin="round"/>
-  <Limb a={sL} b={eL} bend={.1} w={32} col={skin}/><Hand p={eL} col={skin}/>
-  <Limb a={sR} b={eR} bend={-.1} w={32} col={skin}/><Hand p={eR} col={skin}/>
-  <g transform={`translate(0 ${-470+bob})`}><Head skin={skin} ex={ex} look={look} blink={blink} sniff={sniff} rot={rot} mom/></g>
-  {children}
- </g>);
-};
-
-export const Dog=({x,y,s=1,t=0,bark=0})=>(
- <g transform={`translate(${x} ${y}) scale(${s})`}>
-  <g transform={`rotate(${Math.sin(t*14)*18} 70 -70)`}><path d="M70 -70 Q130 -90 120 -150" fill="none" stroke={K} strokeWidth={30} strokeLinecap="round"/><path d="M70 -70 Q130 -90 120 -150" fill="none" stroke={C.tan} strokeWidth={18} strokeLinecap="round"/></g>
-  <ellipse cx={0} cy={-60} rx={85} ry={56} fill={C.tan} stroke={K} strokeWidth={7}/>
-  {[-45,45].map(p=><rect key={p} x={p-16} y={-40} width={32} height={42} rx={14} fill={C.tan} stroke={K} strokeWidth={7}/>)}
-  <g transform={`translate(-72 ${-132-bark*14}) rotate(${-bark*6})`}>
-   <ellipse cx={34} cy={-6} rx={22} ry={44} transform="rotate(20 34 -6)" fill={C.wood} stroke={K} strokeWidth={7}/>
-   <circle r={52} fill={C.tan} stroke={K} strokeWidth={7}/>
-   <ellipse cx={-34} cy={14} rx={34} ry={24} fill={C.cream} stroke={K} strokeWidth={7}/>
-   <circle cx={-56} cy={6} r={10} fill={K}/>
-   <circle cx={-8} cy={-14} r={9} fill={K}/>
-   <path d={`M-52 32 Q-34 ${34+bark*26} -14 30`} fill={bark?'#7b2f2b':'none'} stroke={K} strokeWidth={6} strokeLinecap="round"/>
-   <path d={`M-30 ${34+bark*8} q4 ${14+bark*10} 14 0`} fill="#e48a8a" stroke={K} strokeWidth={5}/>
-  </g>
- </g>);
-
-export const Pile=({x,y,s=1,pop=1})=>(
- <g transform={`translate(${x} ${y}) scale(${s*pop})`}>
-  <path d="M-150 0 Q-165 -60 -95 -82 Q-30 -120 40 -90 Q130 -100 152 -20 L152 0Z" fill={C.grn} stroke={K} strokeWidth={7} strokeLinejoin="round"/>
-  <path d="M-90 -2 Q-100 -70 -30 -70 L-10 -118 L40 -80 L60 -118 L110 -60 Q150 -40 130 -2Z" fill={C.yel} stroke={K} strokeWidth={7} strokeLinejoin="round"/>
-  <path d="M-130 -2 Q-120 -45 -60 -40 Q-10 -48 10 -2Z" fill={C.cream} stroke={K} strokeWidth={6} strokeLinejoin="round"/>
-  <path d="M-110 -12 H-20 M-100 -28 H-40" stroke={C.red} strokeWidth={5} opacity={.7}/>
- </g>);
-export const Stain=({x,y,rx,ry,t})=><g><ellipse cx={x} cy={y} rx={rx*(1+.03*Math.sin(t*9))} ry={ry} fill={C.pee} opacity={.88}/><ellipse cx={x-rx*.3} cy={y-ry*.3} rx={rx*.25} ry={ry*.22} fill="#fff6b0" opacity={.5}/></g>;
-export const Drops=({x,y,t,n=4,len=70})=><g>{Array.from({length:n}).map((_,i)=>{const p=(t*1.6+i/n)%1;return <path key={i} transform={`translate(${x+(i-n/2)*16} ${y+p*len})`} d="M0 -9 Q8 4 0 10 Q-8 4 0 -9Z" fill={C.pee} stroke={K} strokeWidth={2} opacity={1-p}/>;})}</g>;
-export const Wavy=({x,y,t,col=C.grn2,n=3,h=110})=><g fill="none" stroke={col} strokeWidth={9} strokeLinecap="round">{Array.from({length:n}).map((_,i)=><path key={i} opacity={.55+.45*Math.sin(t*6+i*2)} transform={`translate(${x+(i-1)*34} ${y-Math.abs(Math.sin(t*3+i))*14})`} d={`M0 0 q14 ${-h/4} 0 ${-h/2} q-14 ${-h/4} 0 ${-h}`}/>)}</g>;
-export const Note=({x,y,p})=><g transform={`translate(${x+Math.sin(p*8)*14} ${y-p*150})`} opacity={1-p}><ellipse cx={0} cy={0} rx={13} ry={10} fill={K}/><path d="M12 0 V-40 q16 6 14 24" fill="none" stroke={K} strokeWidth={5} strokeLinecap="round"/></g>;
-export const Steam=({x,y,t})=><g>{[0,1,2,3].map(i=>{const p=(t*1.3+i/4)%1,sd=i%2?1:-1;return <circle key={i} cx={x+sd*(150+Math.sin(p*6+i)*14)} cy={y-p*190} r={16+p*34} fill={C.cream} stroke={K} strokeWidth={5} opacity={(1-p)*.9}/>;})}</g>;
-export const Vein=({x,y,k=1})=><g transform={`translate(${x} ${y}) scale(${k})`} fill="none" stroke={C.red} strokeWidth={8} strokeLinecap="round"><path d="M-16 -18 Q0 -6 -16 8 M16 -18 Q0 -6 16 8"/></g>;
-export const Sparkles=({x,y,t})=><g>{[[-120,-60],[130,-30],[40,-130]].map((o,i)=>{const k=.6+.4*Math.sin(t*7+i*2);return <path key={i} transform={`translate(${x+o[0]} ${y+o[1]}) scale(${k}) rotate(${t*40})`} d="M0 -20 L5 -5 L20 0 L5 5 L0 20 L-5 5 L-20 0 L-5 -5Z" fill="#fff2a0" stroke={K} strokeWidth={3}/>;})}</g>;
-export const Bubble=({cx,cy,r,p,tx,ty})=>{
- const bumps=Array.from({length:8}).map((_,i)=>[cx+Math.cos(i*Math.PI/4)*r*.78,cy+Math.sin(i*Math.PI/4)*r*.72,r*.34]);
- const tail=[[tx,ty,16],[lerp(tx,cx,.28),lerp(ty,cy+r*.8,.3),24],[lerp(tx,cx,.55),lerp(ty,cy+r*.8,.62),32]];
- const all=[[cx,cy,r*.82],...bumps,...tail];
- return(<g transform={`translate(${tx} ${ty}) scale(${p}) translate(${-tx} ${-ty})`}>
-  {all.map((c,i)=><circle key={'a'+i} cx={c[0]} cy={c[1]} r={c[2]} fill={C.cream} stroke={K} strokeWidth={7}/>)}
-  {all.map((c,i)=><circle key={'b'+i} cx={c[0]} cy={c[1]} r={c[2]-3} fill={C.cream}/>)}
- </g>);};
-export const Poof=({cx,cy,p})=><g opacity={1-p}>{Array.from({length:10}).map((_,i)=>{const a=i*Math.PI/5,r0=40+p*120,r1=r0+40*(1-p);return <line key={i} x1={cx+Math.cos(a)*r0} y1={cy+Math.sin(a)*r0} x2={cx+Math.cos(a)*r1} y2={cy+Math.sin(a)*r1} stroke={K} strokeWidth={9} strokeLinecap="round"/>;})}<circle cx={cx} cy={cy} r={30+p*90} fill="none" stroke={C.cream} strokeWidth={14}/></g>;
-
-export const ScareDog=({j=.5,t=0})=>{
- const jw=j*230,M=1250+jw;
- const up=Array.from({length:8},(_,i)=>{const x=240+i*86;return `M${x} 1060 L${x+43} ${1150+(i%3)*22} L${x+86} 1060Z`;});
- const lo=Array.from({length:7},(_,i)=>{const x=283+i*86;return `M${x} ${M} L${x+43} ${M-115-(i%2)*28} L${x+86} ${M}Z`;});
- const veins=Array.from({length:14},(_,i)=>{const a=i*Math.PI/7;return [Math.cos(a)*40,Math.sin(a)*40,Math.cos(a+.15)*118,Math.sin(a+.15)*118];});
- const Eye=({x,flip})=>(<g transform={`translate(${x} 720)`}>
-  <circle r={135} fill="#f4efe0" stroke="#000" strokeWidth={10}/>
-  {veins.map((v,i)=><path key={i} d={`M${v[0]} ${v[1]} Q${v[0]*1.6+8} ${v[1]*1.6-8} ${v[2]} ${v[3]}`} stroke="#c01010" strokeWidth={5} fill="none"/>)}
-  <circle cx={flip*10+Math.sin(t*30)*6} cy={8} r={30} fill="#000"/><circle cx={flip*10-6} cy={-2} r={8} fill="#fff"/>
- </g>);
- return(<g>
-  <rect x={-60} y={-60} width={1200} height={2040} fill="#120505"/>
-  <path d="M120 600 L30 110 L340 400Z" fill="#1e110b" stroke="#000" strokeWidth={10}/><path d="M960 600 L1050 110 L740 400Z" fill="#1e110b" stroke="#000" strokeWidth={10}/>
-  <ellipse cx={540} cy={980} rx={480} ry={650} fill="#2b1a12" stroke="#000" strokeWidth={14}/>
-  <ellipse cx={540} cy={1010} rx={310} ry={240} fill="#3b2418" stroke="#000" strokeWidth={8}/>
-  <Eye x={350} flip={1}/><Eye x={730} flip={-1}/>
-  <path d="M190 580 L505 745 L505 520 L300 480Z" fill="#1e110b" stroke="#000" strokeWidth={9}/><path d="M890 580 L575 745 L575 520 L780 480Z" fill="#1e110b" stroke="#000" strokeWidth={9}/>
-  <path d="M430 450 L470 520 M650 450 L610 520 M540 400 V500" stroke="#000" strokeWidth={9} strokeLinecap="round"/>
-  <ellipse cx={540} cy={885} rx={115} ry={72} fill="#000"/><ellipse cx={500} cy={865} rx={30} ry={14} fill="#555"/>
-  <path d={`M230 1060 Q540 990 850 1060 L885 ${M} Q540 ${1400+jw} 195 ${M}Z`} fill="#4a0505" stroke="#000" strokeWidth={8}/>
-  <ellipse cx={540} cy={M+10} rx={165} ry={70} fill="#8a1a1a"/>
-  {lo.map((d,i)=><path key={'l'+i} d={d} fill="#fffbe8" stroke="#000" strokeWidth={5}/>)}
-  {up.map((d,i)=><path key={'u'+i} d={d} fill="#fffbe8" stroke="#000" strokeWidth={5}/>)}
-  <path d="M225 1062 Q540 985 855 1062" fill="none" stroke="#000" strokeWidth={26}/>
-  <path d={`M190 ${M} Q540 ${1520+jw} 890 ${M} L910 ${M+90} Q540 ${1620+jw} 170 ${M+90}Z`} fill="#2b1a12" stroke="#000" strokeWidth={9}/>
-  {[300,420,560,690,800].map((x,i)=><line key={i} x1={x} x2={x+Math.sin(t*9+i)*10} y1={M-10} y2={M+90+((t*3+i*.3)%1)*220} stroke="#c8e6ee" strokeWidth={9} strokeLinecap="round" opacity={.85}/>)}
- </g>);};
-
-export const Room=({T=0})=>{
- const sway=Math.sin(T*1.6)*8;
- return(<g>
-  <rect x={-60} y={-60} width={1200} height={2040} fill={C.wall}/>
-  <rect x={-60} y={1180} width={1200} height={340} fill={C.wall2}/>
-  <path d="M-60 1180 H1140" stroke={C.wood} strokeWidth={14}/>
-  <rect x={-60} y={1500} width={1200} height={480} fill={C.floor}/>
-  <rect x={-60} y={1500} width={1200} height={26} fill={C.wood2}/>
-  {[1590,1690,1800,1910].map(y=><path key={y} d={`M-60 ${y} H1140`} stroke={C.floor2} strokeWidth={6}/>)}
-  {[[200,1500,120,1590],[610,1500,590,1590],[920,1590,940,1690],[330,1690,300,1800]].map((l,i)=><path key={i} d={`M${l[0]} ${l[1]} V${l[3]}`} stroke={C.floor2} strokeWidth={5}/>)}
-  <path d="M110 900 L350 900 L760 1900 L400 1900Z" fill="#fff0a8" opacity={.13}/>
-  <rect x={90} y={430} width={300} height={470} fill="#fbf1c6" stroke={K} strokeWidth={9}/>
-  {[140,190,240,290,340].map(x=><line key={x} x1={x} x2={x} y1={430} y2={900} stroke={C.wood2} strokeWidth={8}/>)}
-  <line x1={90} x2={390} y1={660} y2={660} stroke={C.wood2} strokeWidth={8}/>
-  <rect x={74} y={414} width={332} height={500} fill="none" stroke={C.wood} strokeWidth={22}/>
-  <path d={`M70 410 H170 Q${150+sway} 600 ${160+sway} 930 H70Z`} fill={C.grn} stroke={K} strokeWidth={7}/>
-  <path d={`M410 410 H310 Q${330+sway} 600 ${320+sway} 930 H410Z`} fill={C.grn} stroke={K} strokeWidth={7}/>
-  <rect x={470} y={330} width={110} height={150} fill={C.cream} stroke={K} strokeWidth={6}/><rect x={470} y={330} width={110} height={34} fill={C.red} stroke={K} strokeWidth={6}/>
-  <path d="M488 390 H562 M488 414 H562 M488 438 H540" stroke={C.wood} strokeWidth={5}/>
-  <g transform="translate(900 400)"><path d="M0 0 q20 -20 50 -8 q16 -22 40 -4 l16 -6 l-12 14 q-16 12 -40 10 q-20 20 -52 6Z" fill={C.grn2} stroke={K} strokeWidth={5}/><circle cx={74} cy={-8} r={5} fill={K}/></g>
-  <line x1={540} y1={-20} x2={540} y2={110} stroke={K} strokeWidth={8}/>
-  <g transform={`rotate(${T*330} 540 130)`}>{[0,120,240].map(a=><ellipse key={a} cx={540+Math.cos(rad(a))*140} cy={130+Math.sin(rad(a))*140} rx={90} ry={16} transform={`rotate(${a} ${540+Math.cos(rad(a))*140} ${130+Math.sin(rad(a))*140})`} fill={C.wood} stroke={K} strokeWidth={6}/>)}</g>
-  <circle cx={540} cy={130} r={30} fill={C.wood2} stroke={K} strokeWidth={7}/>
-  <rect x={10} y={1030} width={44} height={330} fill={C.wood2} stroke={K} strokeWidth={7}/>
-  <rect x={44} y={1290} width={540} height={60} fill={C.wood} stroke={K} strokeWidth={7}/>
-  <rect x={50} y={1350} width={34} height={170} fill={C.wood2} stroke={K} strokeWidth={7}/><rect x={540} y={1350} width={34} height={170} fill={C.wood2} stroke={K} strokeWidth={7}/>
-  <path d="M54 1296 V1200 Q54 1176 80 1176 H560 Q584 1176 584 1200 V1296Z" fill={C.yel} stroke={K} strokeWidth={8}/>
-  <path d="M120 1200 V1290 M260 1200 V1290 M400 1200 V1290 M520 1200 V1290" stroke={C.grn2} strokeWidth={14}/>
-  <ellipse cx={130} cy={1168} rx={80} ry={34} fill={C.cream} stroke={K} strokeWidth={7}/>
-  <rect x={86} y={1390} width={450} height={110} fill={C.dark} opacity={.28}/>
- </g>);};
-
-export const Almirah=({th=0,children})=>{
- const sx=Math.cos(rad(th));
- const Door=({hx,dir})=>(<g transform={`translate(${hx} 0) scale(${sx} 1) translate(${-hx} 0)`}>
-  <rect x={dir>0?hx:hx-177} y={600} width={177} height={840} fill={C.wood} stroke={K} strokeWidth={8}/>
-  <rect x={dir>0?hx+22:hx-155} y={640} width={133} height={360} fill="none" stroke={C.wood2} strokeWidth={7}/>
-  <rect x={dir>0?hx+22:hx-155} y={1040} width={133} height={360} fill="none" stroke={C.wood2} strokeWidth={7}/>
-  <circle cx={dir>0?hx+158:hx-158} cy={1020} r={12} fill={C.yel} stroke={K} strokeWidth={5}/>
- </g>);
- return(<g>
-  <rect x={650} y={560} width={390} height={960} fill={C.wood2} stroke={K} strokeWidth={9}/>
-  <rect x={634} y={534} width={422} height={42} fill={C.wood} stroke={K} strokeWidth={8}/>
-  <rect x={668} y={600} width={354} height={840} fill="#53382a"/>
-  <line x1={668} x2={1022} y1={800} y2={800} stroke={C.wood2} strokeWidth={10}/><line x1={668} x2={1022} y1={1000} y2={1000} stroke={C.wood2} strokeWidth={10}/>
-  <rect x={668} y={1440} width={354} height={80} fill={C.wood} stroke={K} strokeWidth={8}/>
-  <rect x={680} y={1520} width={40} height={26} fill={C.dark}/><rect x={970} y={1520} width={40} height={26} fill={C.dark}/>
-  <clipPath id="int"><rect x={668} y={600} width={354} height={840}/></clipPath>
-  <g clipPath="url(#int)">{children}</g>
-  <Door hx={668} dir={1}/><Door hx={1022} dir={-1}/>
- </g>);};
-'''
-
-MAIN = r'''import React from 'react';
-import {AbsoluteFill,Audio,staticFile,useCurrentFrame} from 'remotion';
-import T from './timing.json';
-import {C,clamp,ease,seg,lerp,back,Room,Almirah,Kid,Mom,Dog,Pile,Stain,Drops,Wavy,Note,Steam,Vein,Sparkles,Bubble,Poof,ScareDog} from './Art';
-
-const FPS=T.fps;
-const bl=s=>{const c=(s*60)%140;return c<7?Math.sin(c/7*Math.PI):0;};
-const kf=(u,a)=>{if(u<=a[0][0])return a[0].slice(1);for(let i=1;i<a.length;i++){if(u<=a[i][0]){const p=ease((u-a[i-1][0])/(a[i][0]-a[i-1][0]));return a[i].slice(1).map((v,j)=>a[i-1][j+1]+(v-a[i-1][j+1])*p);}}return a[a.length-1].slice(1);};
-
-const CAM=[
- [[0,540,960,1],[.07,380,1250,2],[.45,380,1270,2.2],[.55,380,1450,1.2],[.9,380,1450,1.25]],
- [[0,300,1300,1.15],[.18,430,1350,1.2],[.40,780,1350,1.25],[.46,845,1100,1.7],[.62,845,1030,2.3],[.88,845,1030,2.5],[.9,845,1040,2.7]],
- [[0,540,1100,1],[.2,540,1150,1.1],[.22,790,1250,1.7],[.34,790,1230,2.4],[.5,790,1230,2.4],[.58,300,1260,1.9],[.78,300,1260,2],[.8,420,1300,1.4]],
- [[0,330,1500,1.5],[.28,540,1450,1.2],[.4,780,1250,1.5],[.6,420,1100,1.5],[.66,600,900,1.9],[1,600,900,1.95]],
- [[0,600,1200,1.3],[.12,600,900,1.9],[.28,780,1260,1.9],[.5,330,1260,1.9],[.56,540,1000,1],[.86,540,1000,1.05],[.93,330,1240,2.2]],
- [[0,330,1225,2.97],[.41,330,1240,3.4]],
-];
-const FACE=[[380,1240],[845,1040],[300,1225],[600,860],[330,1225],[330,1240]];
-
-const S1=({t,u,Tg})=>{
- const p=Math.abs(Math.sin(u*Math.PI*4)),sq=Math.max(0,1-p*3),kx=380,ky=1720,hy=ky-455*1.1-p*55;
- return(<g><Room T={Tg}/>
-  <Kid x={kx} y={ky} s={1.1} lift={p*55} squash={sq} t={t} ex="angry" look={[Math.sin(t*5)*.5,.2]} aL={-25+Math.sin(t*30)*12} aR={25-Math.sin(t*30)*12} rot={Math.sin(t*40)*2.5} blink={bl(Tg)}/>
-  <Steam x={kx} y={hy-10} t={t}/><Vein x={kx+75} y={hy-105} k={.8+.4*Math.sin(t*14)}/>
- </g>);};
-
-const S2=({t,u,Tg})=>{
- const wp=seg(u,0,.42),dp=seg(u,.42,.54),jp=seg(u,.54,.63),inside=u>=.63,th=75*ease(dp);
- let kx=lerp(90,770,wp),ky=1720,ks=1.1,lift=0;
- if(u>.54&&!inside){kx=lerp(770,845,ease(jp));ky=lerp(1720,1400,ease(jp));ks=lerp(1.1,.8,ease(jp));lift=Math.sin(jp*Math.PI)*240;}
- if(inside){kx=845;ky=1400;ks=.8;}
- const back_=(u>.1&&u<.2)||(u>.27&&u<.37);
- let ex='sneaky',look=back_?[-1,-.2]:[1,0];
- if(u>.42&&u<.54)look=[.8,-.5];
- if(inside&&u<.9){ex='relief';look=[0,0];}
- if(u>=.9)look=[Math.sin(t*9)>0?1:-1,0];
- const walk=wp<1?wp*Math.PI*2*7:0,sp=seg(u,.65,.88);
- const kid=<Kid x={kx} y={ky} s={ks} lift={lift} walk={walk} t={t} ex={ex} look={look} blink={ex==='relief'?0:bl(Tg)} rot={inside&&u<.9?Math.sin(t*3)*3:0} aL={inside?-20:-65} aR={inside?20:65}>
-  {!inside&&<Pile x={0} y={-215} s={.55}/>}</Kid>;
- return(<g><Room T={Tg}/>
-  <Almirah th={th}>{inside&&<g>{kid}
-   <Pile x={845} y={1440} s={1.35} pop={back(seg(u,.63,.7))}/>
-   <Stain x={845} y={1330} rx={lerp(10,125,sp)} ry={lerp(4,26,sp)} t={t}/>
-   {u>.65&&u<.9&&<g><Wavy x={845} y={1280} t={t} col="#e6d36a"/><Sparkles x={845} y={1040} t={t}/></g>}
-  </g>}</Almirah>
-  {!inside&&kid}
-  {u>.7&&<g><rect x={832} y={1440} width={26} height={lerp(0,92,seg(u,.7,.8))} fill={C.pee}/><ellipse cx={845} cy={1538} rx={lerp(0,160,seg(u,.75,.95))} ry={26} fill={C.pee} opacity={.9}/>{u<.88&&<Drops x={845} y={1450} t={t} n={3} len={70}/>}</g>}
- </g>);};
-
-const S3=({t,u,Tg})=>{
- const arr=ease(seg(u,0,.25)),mx=lerp(1350,800,arr),ms=1.15;
- const sn=u>.28&&u<.48?Math.abs(Math.sin((u-.28)/.2*Math.PI*3)):0,gag=u>.5&&u<.6;
- const ksn=u>.6&&u<.78?Math.abs(Math.sin((u-.6)/.18*Math.PI*2)):0,shr=ease(seg(u,.82,.88));
- const kLook=u<.55?[1,-.1]:u<.8?[Math.sin(t*3),-1]:[0,-.3];
- return(<g><Room T={Tg}/><Almirah th={0}/>
-  <Kid x={300} y={1720} s={1.1} t={t} ex="innocent" look={kLook} sniff={ksn} aL={lerp(-12,-135,shr)} aR={lerp(12,135,shr)} blink={bl(Tg)} sweat={u>.8?1:0}/>
-  {u>.55&&u<.82&&[0,1,2].map(i=><Note key={i} x={370} y={1190} p={(t*1.1+i/3)%1}/>)}
-  <Mom x={mx} y={1720} s={ms} t={t} ex={gag?'gross':'flat'} look={u<.5?[-.6,.4]:[-1,0]} sniff={sn} walk={u<.25?arr*Math.PI*2*5:0} aL={-95} aR={35} rot={gag?Math.sin(t*45)*4:-sn*5} tint={gag?1:0} blink={bl(Tg)}>
-   <Pile x={-257} y={-320} s={.55}/></Mom>
-  {u<.62&&<Wavy x={mx-257*ms} y={1720-340*ms-70} t={t}/>}
- </g>);};
-
-const S4=({t,u,Tg})=>{
- const gp=seg(u,0,.3),ma=ease(seg(u,.3,.45)),mx=lerp(1350,780,ma);
- const ex=u<.3?'relief':u<.5?'shock':u<.6?'sneaky':'grin';
- const pt=ease(seg(u,.58,.64)),bp=back(seg(u,.62,.72)),bk=Math.max(0,1-Math.abs(u-.7)/.035,1-Math.abs(u-.78)/.035);
- return(<g><Room T={Tg}/><Almirah th={0}/>
-  <Stain x={330} y={1740} rx={lerp(10,175,gp)} ry={lerp(4,30,gp)} t={t}/>
-  <Kid x={330} y={1720} s={1.1} t={t} ex={ex} look={u<.5?[0,.3]:[1,-1]} aL={-15} aR={lerp(15,130,pt)} sweat={u>.3?1:0} blink={u<.3?0:bl(Tg)} squash={u<.3?.15*Math.sin(t*6)**2:0}/>
-  <Mom x={mx} y={1720} s={1.15} t={t} ex={u<.3?'flat':u<.62?'angry':'flat'} look={u<.62?[-1,.5]:[-1,-.6]} aL={-50} aR={55} walk={u>.3&&u<.45?ma*Math.PI*2*4:0} rot={u>.3&&u<.6?Math.sin(t*20)*2:0} blink={bl(Tg)}/>
-  {u>.62&&<g><Bubble cx={600} cy={790} r={190} p={bp} tx={400} ty={1085}/><g transform={`translate(600 900) scale(${bp}) translate(-600 -900)`}><Dog x={600} y={905} s={.9} t={t} bark={bk}/></g></g>}
- </g>);};
-
-const S5=({t,u,Tg})=>{
- const pop=seg(u,.12,.3);
- return(<g><Room T={Tg}/><Almirah th={0}/>
-  <Stain x={330} y={1740} rx={175} ry={30} t={0}/>
-  <Kid x={330} y={1720} s={1.1} t={t} ex="grin" look={u>.5?[Math.sin(t*8)>0?1:-1,0]:[1,-.2]} aL={-18} aR={18} rot={Math.sin(t*25)*1.5} sweat={1} blink={bl(Tg)}/>
-  <Mom x={780} y={1720} s={1.15} t={t} ex="flat" look={u<.28?[-1,-.6]:[-1,.15]} aL={-50} aR={55} blink={bl(Tg)}/>
-  {u<.15&&<g><Bubble cx={600} cy={790} r={190} p={1} tx={400} ty={1085}/><Dog x={600} y={905} s={.9} t={t} bark={0}/></g>}
-  {u>=.12&&pop<1&&<Poof cx={600} cy={800} p={pop}/>}
- </g>);};
-
-const S6=({t,u,Tg})=>(<g><Room T={Tg}/><Almirah th={0}/>
-  <Stain x={330} y={1740} rx={175} ry={30} t={0}/>
-  <Kid x={330} y={1720} s={1.1} t={t} ex={t<.5?'grin':t<.95?'flat':'shock'} look={[lerp(1,-1,seg(t,.3,.9)),0]} aL={-18} aR={18} sweat={1} blink={bl(Tg)} rot={Math.sin(t*25)*(t>.9?3:1)}/>
-  <Mom x={780} y={1720} s={1.15} t={t} ex="flat" look={[-1,.15]} aL={-50} aR={55}/>
- </g>);
-const SCENES=[S1,S2,S3,S4,S5,S6];
-
-export const Main=()=>{
- const f=useCurrentFrame(),NB=T.bounds.length-1;
- let k=NB-1;for(let i=0;i<NB;i++){if(f<T.bounds[i+1]){k=i;break;}}
- const hold=T.holds[k],t0=T.bounds[k];
- const clock=g=>{let c=g;for(const [a,b] of T.holds){if(g>a)c-=Math.min(g,b)-a;}return c;};
- const t=(clock(f)-clock(t0))/FPS,ta=Math.max(.01,(hold[0]-t0)/FPS),u=Math.min(1,t/ta),Tg=clock(f)/FPS;
- const hp=f>=hold[0]?f-hold[0]:-1,pz=hp>=0?ease(hp/10):0;
- const scare=k===5&&t>=1.25;
- let [cx,cy,z]=kf(u,CAM[k]);
- cx=lerp(cx,FACE[k][0],pz);cy=lerp(cy,FACE[k][1],pz);
- z=z*(1+.35*pz)*(1+(hp>0?hp*.0006:0))*(1+.012*(T.env[f]||0));
- z=Math.max(1,z);cx=clamp(cx,540/z,1080-540/z);cy=clamp(cy,960/z,1920-960/z);
- const shk=(hp>=0&&hp<12?(1-hp/12)*12:0)+(k===0?3:0)+(k===5?2+8*seg(t,.5,1.25):0),sx=Math.sin(f*2.9)*shk,sy=Math.cos(f*3.7)*shk;
- const dark=k===5&&t<1.25?lerp(0,.55,t/1.25)+((f%7===0&&t>.7)?.25:0):0;
- const seed=Math.floor(clock(f)/6)%4+1,Sc=SCENES[k];
- let sc=null;
- if(scare){
-  const td=t-1.28,W=<rect width={1080} height={1920}/>;
-  if(t>=2.55)sc=<g><rect width={1080} height={1920} fill="#000"/><rect width={1080} height={1920} filter="url(#st)" opacity={.22}/></g>;
-  else if(t>=2.5)sc=<rect width={1080} height={1920} fill="#fff"/>;
-  else if(td<0)sc=<rect width={1080} height={1920} fill="#000"/>;
-  else{
-   const lunge=td<.07?lerp(.55,1.25,back(td/.07)):1.25+td*.2+Math.sin(td*45)*.04;
-   const jx=Math.sin(f*7.3)*30,jy=Math.cos(f*5.9)*30,j=.35+.65*Math.abs(Math.sin(td*13)),inv=(f%11)<2;
-   sc=<g><g transform={`translate(${540+jx} ${960+jy}) scale(${lunge}) translate(-540 -960)`} filter={inv?'url(#inv)':undefined}><ScareDog j={j} t={td}/></g>
-    {f%5===0&&<rect width={1080} height={1920} fill="#ff0000" opacity={.35}/>}</g>;
-  }
- }
- return(<AbsoluteFill style={{background:'#000'}}>
-  <Audio src={staticFile('mix.wav')}/>
-  <svg width={1080} height={1920} viewBox="0 0 1080 1920">
-   <defs>
-    <filter id="boil" x="-5%" y="-5%" width="110%" height="110%"><feTurbulence type="fractalNoise" baseFrequency="0.014" numOctaves="2" seed={seed} result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="6" xChannelSelector="R" yChannelSelector="G"/></filter>
-    <filter id="inv"><feColorMatrix type="matrix" values="-1 0 0 0 1  0 -1 0 0 1  0 0 -1 0 1  0 0 0 1 0"/></filter>
-    <filter id="st"><feTurbulence type="fractalNoise" baseFrequency="0.8" seed={f%50}/><feColorMatrix type="saturate" values="0"/></filter>
-    <radialGradient id="vig" cx="50%" cy="50%" r="75%"><stop offset="55%" stopColor="#5a3a1c" stopOpacity="0"/><stop offset="100%" stopColor="#5a3a1c" stopOpacity=".38"/></radialGradient>
-   </defs>
-   {scare?sc:<g>
-    <g transform={`translate(${540+sx} ${960+sy}) scale(${z}) translate(${-cx} ${-cy})`}><g filter="url(#boil)"><Sc t={t} u={u} Tg={Tg}/></g></g>
-    <rect width={1080} height={1920} fill="#ffe3a0" opacity={.07}/>
-    <rect width={1080} height={1920} fill="url(#vig)"/>
-    {dark>0&&<rect width={1080} height={1920} fill="#000" opacity={Math.min(.85,dark)}/>}
-    {hp>=0&&hp<6&&<rect width={1080} height={1920} fill="#fff" opacity={.45*(1-hp/6)}/>}
-   </g>}
-  </svg>
- </AbsoluteFill>);
-};
-'''
-
-INDEX = "import {registerRoot} from 'remotion';\nimport {Root} from './Root';\nregisterRoot(Root);\n"
-ROOT = ("import React from 'react';\nimport {Composition} from 'remotion';\nimport {Main} from './Main';\nimport T from './timing.json';\n"
-        "export const Root=()=><Composition id=\"Main\" component={Main} durationInFrames={T.total} fps={T.fps} width={1080} height={1920}/>;\n")
-
-RENDER_JS = r"""const path=require('path'),fs=require('fs');
-const {bundle}=require('@remotion/bundler');
-const {renderMedia,selectComposition}=require('@remotion/renderer');
-(async()=>{
- const dir=process.argv[2],size=+process.argv[3];
- fs.mkdirSync(dir,{recursive:true});
- const serveUrl=await bundle({entryPoint:path.resolve('src/index.jsx'),publicDir:path.resolve('public'),onProgress:p=>console.log('BUNDLE '+p)});
- const composition=await selectComposition({serveUrl,id:'Main'});
- const total=composition.durationInFrames,n=Math.ceil(total/size);
- console.log('START '+total+' '+n);
- let done=0;
- for(let i=0;i<n;i++){
-  const a=i*size,b=Math.min(total-1,a+size-1),name=path.join(dir,'part_'+String(i).padStart(4,'0')+'.mp4');
-  if(fs.existsSync(name)){done+=b-a+1;console.log('SKIP '+done+' '+total);continue;}
-  const tmp=name.replace(/\.mp4$/,'.tmp.mp4');
-  await renderMedia({composition,serveUrl,codec:'h264',crf:17,pixelFormat:'yuv420p',muted:true,frameRange:[a,b],outputLocation:tmp,
-   onProgress:({renderedFrames})=>console.log('FRAME '+(done+renderedFrames)+' '+total)});
-  fs.renameSync(tmp,name);done+=b-a+1;console.log('CHUNK '+(i+1)+' '+n+' '+done+' '+total);
- }
- console.log('DONE');
-})().catch(e=>{console.error(e);process.exit(1);});
 """
+One-file pipeline: audio analysis -> Remotion project -> 1080x1920 / 60fps MP4 (audio-synced).
+Run:  python make_video.py
+Needs: Python 3.8+, Node.js 18+ (npm), internet on first run (npm + Chrome for Remotion).
+"""
+import os, sys, re, json, math, time, shutil, subprocess, threading, array
 
+OUT_DIR = r"C:\Users\laptop villa\Documents\cnd"
+AUDIO   = os.path.join(OUT_DIR, "Elevenlabs.mp3")
+PROJ    = os.path.join(OUT_DIR, "remotion_project")
+OUT_MP4 = os.path.join(OUT_DIR, "story_9x16_60fps.mp4")
+FPS, W, H = 60, 1080, 1920
+# relative narration length of the 8 story scenes (characters per paragraph) -> snapped to real pauses
+WEIGHTS = [330, 190, 330, 330, 210, 130, 120, 260]
+N_STEPS = 6
 
-# ----------------------------------------------------------------------------- audio analysis
-def ffcmd():
-    ff = shutil.which("ffmpeg")
-    return [ff] if ff else [shutil.which("npx") or "npx", "remotion", "ffmpeg"]
+# ----------------------------------------------------------------- helpers
+def step(i, msg): print(f"\n[{i}/{N_STEPS}] {msg}", flush=True)
+def bar(f, w=32): n = int(max(0, min(1, f)) * w); return "█" * n + "░" * (w - n)
+def fmt(s): s = int(s); return f"{s//60:02d}:{s%60:02d}"
 
+SPIN = '|/-\\'
+def run_spin(cmd, cwd, label):
+    p = subprocess.Popen(cmd, cwd=cwd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, encoding="utf-8", errors="replace")
+    log = []
+    th = threading.Thread(target=lambda: [log.append(l) for l in p.stdout]); th.start()
+    t0, k = time.time(), 0
+    while p.poll() is None:
+        print(f"\r   {SPIN[k % 4]} {label}  {fmt(time.time()-t0)}", end="", flush=True); k += 1; time.sleep(0.2)
+    th.join(); print(f"\r   ✓ {label}  {fmt(time.time()-t0)}        ")
+    if p.returncode != 0:
+        print("".join(log[-40:])); sys.exit(f"Failed: {cmd}")
 
-def decode_pcm(mp3, raw):
-    # Remotion's bundled ffmpeg has no raw muxer, so decode to a 16-bit wav and read it with the wave module
-    wav = str(Path(raw).with_suffix(".wav"))
-    run(ffcmd() + ["-y", "-i", mp3, "-ac", "1", "-ar", str(SR), "-c:a", "pcm_s16le", "-f", "wav", wav], cwd=PROJ)
-    with wave.open(wav, "rb") as w:
-        data = np.frombuffer(w.readframes(w.getnframes()), dtype="<i2").astype(np.float32) / 32768
-    Path(wav).unlink(missing_ok=True)
-    return data
+def find_ffmpeg():
+    f = shutil.which("ffmpeg")
+    if f: return f
+    print("   ffmpeg not on PATH -> installing imageio-ffmpeg ...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "imageio-ffmpeg"])
+    import imageio_ffmpeg
+    return imageio_ffmpeg.get_ffmpeg_exe()
 
+# ----------------------------------------------------------------- 1. checks
+step(1, "Checking environment")
+if not os.path.isfile(AUDIO): sys.exit(f"Audio not found: {AUDIO}")
+for tool in ("node", "npm"):
+    if not shutil.which(tool): sys.exit(f"{tool} not found. Install Node.js from nodejs.org")
+FFMPEG = find_ffmpeg()
+print(f"   audio : {AUDIO}\n   output: {OUT_MP4}")
 
-def find_pauses(x, dur):
-    win = SR // 100
-    n = len(x) // win
-    db = 20 * np.log10(np.sqrt((x[:n * win].reshape(n, win) ** 2).mean(1)) + 1e-9)
-    found = []
-    for thr in (-38, -34, -30, -26, -22):
-        found, i = [], 0
-        sil = db < thr
-        while i < n:
-            if sil[i]:
-                j = i
-                while j < n and sil[j]:
-                    j += 1
-                a, b = i / 100, j / 100
-                if b - a >= .22 and a > .3 and b < dur - .25:
-                    found.append((a, b))
-                i = j
-            else:
-                i += 1
-        if len(found) >= 4:
-            break
-    found = sorted(sorted(found, key=lambda p: p[0] - p[1])[:4])
-    k = 1
-    while len(found) < 4:                      # fallback: even split
-        found.append((dur * k / 5, dur * k / 5)); k += 1
-    return sorted(found)
+# ----------------------------------------------------------------- 2. audio analysis
+step(2, "Analysing audio (duration, loudness envelope @60fps, pauses)")
+raw = subprocess.run([FFMPEG, "-v", "error", "-i", AUDIO, "-f", "s16le", "-ac", "1", "-ar", "8000", "-"],
+                     stdout=subprocess.PIPE).stdout
+pcm = array.array("h"); pcm.frombytes(raw[: len(raw) // 2 * 2])
+dur = len(pcm) / 8000.0
+TOTAL = math.ceil(dur * FPS)
+spf = 8000 / FPS
+rms = []
+for f in range(TOTAL):
+    seg = pcm[int(f * spf): int((f + 1) * spf)]
+    rms.append(math.sqrt(sum(x * x for x in seg) / len(seg)) if seg else 0.0)
+db = [20 * math.log10(max(r, 1) / 32768) for r in rms]
+ref = sorted(rms)[int(len(rms) * 0.95)] or 1
+env = [min(1.0, r / ref) for r in rms]
+sm = []                                   # 5-frame smoothing
+for i in range(len(env)):
+    a = env[max(0, i - 2): i + 3]; sm.append(round(sum(a) / len(a), 3))
+# pauses: >=0.2 s below -32 dBFS
+pauses, run0 = [], None
+for i, d in enumerate(db + [0]):
+    if d < -32 and run0 is None: run0 = i
+    if d >= -32 and run0 is not None:
+        if i - run0 >= 12: pauses.append((run0, i))
+        run0 = None
+pauses = [p for p in pauses if p[0] > 30 and p[1] < TOTAL - 30]
+beats = [p[1] for p in pauses]
+mids = [(a + b) // 2 for a, b in pauses]
+bounds, acc, tw = [0], 0, sum(WEIGHTS)
+for w in WEIGHTS[:-1]:
+    acc += w; tgt = int(acc / tw * TOTAL)
+    near = min(mids, key=lambda m: abs(m - tgt), default=None)
+    b = near if near is not None and abs(near - tgt) < 3.5 * FPS else tgt
+    b = max(b, bounds[-1] + 4 * FPS)
+    bounds.append(b)
+bounds.append(TOTAL)
+print(f"   duration {dur:.2f}s -> {TOTAL} frames | {len(pauses)} pauses | scene cuts (s): "
+      + ", ".join(f"{b/FPS:.1f}" for b in bounds[1:-1]))
 
+# ----------------------------------------------------------------- 3. project files
+step(3, "Writing Remotion project")
+os.makedirs(os.path.join(PROJ, "src"), exist_ok=True)
+os.makedirs(os.path.join(PROJ, "public"), exist_ok=True)
+shutil.copyfile(AUDIO, os.path.join(PROJ, "public", "Elevenlabs.mp3"))
+def wr(rel, txt):
+    with open(os.path.join(PROJ, rel), "w", encoding="utf-8") as f: f.write(txt)
+wr("package.json", json.dumps({"name": "story", "version": "1.0.0", "private": True, "dependencies": {
+    "remotion": "^4.0.0", "@remotion/cli": "^4.0.0", "react": "18.3.1", "react-dom": "18.3.1",
+    "typescript": "5.4.5", "@types/react": "18.3.3"}}, indent=1))
+wr("tsconfig.json", json.dumps({"compilerOptions": {"target": "ES2018", "module": "commonjs", "jsx": "react-jsx",
+    "strict": False, "resolveJsonModule": True, "esModuleInterop": True, "skipLibCheck": True,
+    "lib": ["dom", "es2019"]}}))
+import zlib, struct, random, base64
+def grain_uri(n=128):
+    rnd = random.Random(7)
+    rows = b"".join(b"\x00" + bytes(rnd.randrange(256) for _ in range(n)) for _ in range(n))
+    def ch(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    png = (b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", struct.pack(">IIBBBBB", n, n, 8, 0, 0, 0, 0))
+           + ch(b"IDAT", zlib.compress(rows)) + ch(b"IEND", b""))
+    return "data:image/png;base64," + base64.b64encode(png).decode()
+wr("src/data.json", json.dumps({"total": TOTAL, "bounds": bounds, "beats": beats, "env": sm, "grain": grain_uri()}))
+wr("src/index.ts", "import {registerRoot} from 'remotion';\nimport {Root} from './Root';\nregisterRoot(Root);\n")
+wr("src/Root.tsx", """import React from 'react';
+import {Composition} from 'remotion';
+import {Main} from './Video';
+import D from './data.json';
+export const Root = () => <Composition id="Main" component={Main} durationInFrames={D.total} fps={60} width={1080} height={1920} />;
+""")
 
-def frame_env(x, total):
-    sq = np.concatenate([[0], np.cumsum(x.astype(np.float64) ** 2)])
-    idx = np.arange(total)
-    a = np.clip(((idx - .5) * SR / FPS).astype(int), 0, len(x))
-    b = np.clip(((idx + 1.5) * SR / FPS).astype(int), 0, len(x))
-    e = np.sqrt((sq[b] - sq[a]) / np.maximum(b - a, 1))
-    e = np.clip(e / (np.percentile(e, 98) + 1e-9), 0, 1)
-    return np.convolve(e, [.25, .5, .25], "same")
+VIDEO = r'''import React from 'react';
+import {AbsoluteFill, Audio, Sequence, staticFile, useCurrentFrame} from 'remotion';
+import D from './data.json';
 
+const W = 1080, H = 1920, XF = 24;
+const C = {n0:'#05080f',n1:'#0b1530',n2:'#14234a',n3:'#22345f',b1:'#4a3626',b2:'#2b1f16',b3:'#6a4e37',
+  y:'#e6d686',y2:'#b3a35a',sk:'#b89d89',pale:'#cfc8bd',amb:'#d19a43',bone:'#e4dfd2',blk:'#05070c'};
+const SK = '#c4b8ab';
+const cl = (v:number,a=0,b=1)=>Math.min(b,Math.max(a,v));
+const es = (x:number)=>{x=cl(x);return x*x*(3-2*x)};
+const lp = (a:number,b:number,p:number)=>a+(b-a)*es(p);
+const sg = (p:number,a:number,b:number)=>cl((p-a)/(b-a));
+const OL:any = {stroke:C.n0,strokeWidth:5,strokeLinejoin:'round',strokeLinecap:'round'};
 
-# ----------------------------------------------------------------------------- sound design
-rng = np.random.default_rng(7)
-def tt(d): return np.arange(int(d * SR)) / SR
-def hann(d): return np.hanning(int(d * SR))
-def lp(n, k): return np.convolve(n, np.ones(k) / k, "same")
-def sine(f, d, dec=8): t = tt(d); return np.sin(2 * np.pi * f * t) * np.exp(-dec * t)
-def slide(f0, f1, d, dec=3, saw=False, vib=0):
-    t = tt(d); f = f0 * (f1 / f0) ** (t / d) * (1 + vib * np.sin(2 * np.pi * 6 * t))
-    ph = np.cumsum(2 * np.pi * f / SR)
-    s = (((ph / (2 * np.pi)) % 1) * 2 - 1) if saw else np.sin(ph)
-    return lp(s, 6) * np.exp(-dec * t) if saw else s * np.exp(-dec * t)
-def noise(d, dec=10, l=0, h=0):
-    n = rng.standard_normal(int(d * SR))
-    if l: n = lp(n, l)
-    if h: n = n - lp(n, h)
-    return n * np.exp(-dec * tt(d))
+/* ---------- light & texture helpers ---------- */
+const Glow = ({x,y,r,a=1,c='gl'}:any)=><circle cx={x} cy={y} r={r} fill={`url(#${c})`} opacity={a}/>;
+const Dark = ({x,y,r,a=.8,id}:any)=><><radialGradient id={id} gradientUnits="userSpaceOnUse" cx={x} cy={y} r={r}>
+  <stop offset=".22" stopColor="#02040a" stopOpacity="0"/><stop offset="1" stopColor="#02040a" stopOpacity={a}/></radialGradient>
+  <rect width={W} height={H} fill={`url(#${id})`}/></>;
+const Sh = ({x,y,L,w=50,a=.55}:any)=><polygon points={`${x-w},${y} ${x+w},${y} ${x+L+w*.3},${y+38} ${x+L-w*.3},${y+6}`} fill="#02040a" opacity={a} filter="url(#bl)"/>;
+const Flash = ({t,a=1}:any)=><rect width={W} height={H} fill={(Math.floor(t/9)%2)?'#3b5bc4':'#8c2f35'} opacity={a*.2}/>;
+const Wood = ({x,y,w,h,c=C.b1,g=5}:any)=><g><rect x={x} y={y} width={w} height={h} fill={c} {...OL}/>
+  {Array.from({length:g}).map((_,i)=><path key={i} d={`M${x+8},${y+(i+1)*h/(g+1)} q${w/4},-7 ${w/2},0 t${w/2-16},0`} stroke={C.b2} strokeWidth={2.5} fill="none" opacity={.7}/>)}</g>;
+const Dresser = ({x,y,w=300,h=240}:any)=><g><Wood x={x} y={y} w={w} h={h} g={6}/>
+  {[0,1].map(i=><g key={i}><rect x={x+16} y={y+16+i*108} width={w-32} height={96} fill="none" {...OL} strokeWidth={4}/>
+  <circle cx={x+w/2} cy={y+64+i*108} r={9} fill={C.y2} {...OL} strokeWidth={3}/></g>)}</g>;
+const Lamp = ({x,y,f}:any)=><g><Glow x={x} y={y-50} r={560} a={f*.6}/>
+  <path d={`M${x-24},${y} h48 l-6,-26 h-36z`} fill={C.b1} {...OL}/>
+  <path d={`M${x-36},${y-26} L${x-22},${y-84} h44 L${x+36},${y-26}z`} fill={C.y} {...OL}/></g>;
+const Room = ({fy=1400}:any)=><g>
+  <rect width={W} height={fy} fill="url(#wall)"/>
+  {Array.from({length:12}).map((_,i)=><rect key={i} x={i*95+20} width={36} height={fy} fill={C.n2} opacity={.18}/>)}
+  <rect y={fy} width={W} height={H-fy} fill={C.b2}/>
+  {Array.from({length:9}).map((_,i)=><path key={i} d={`M0,${fy+24+i*i*9+i*12}H${W}`} stroke={C.n0} strokeWidth={3} opacity={.5}/>)}
+  <rect y={fy-34} width={W} height={34} fill={C.b1} {...OL}/></g>;
+const Win = ({x,y,w=320,h=470}:any)=><g><rect x={x} y={y} width={w} height={h} fill={C.n3} {...OL} strokeWidth={10} stroke={C.b1}/>
+  <circle cx={x+w*.75} cy={y+h*.22} r={34} fill={C.pale} opacity={.85}/>
+  <path d={`M${x+w/2},${y}V${y+h}M${x},${y+h*.55}H${x+w}`} stroke={C.b1} strokeWidth={8}/></g>;
 
-def mx(*a):
-    n = max(len(i) for i in a); o = np.zeros(n)
-    for i in a: o[:len(i)] += i
-    return o
+/* ---------- characters ---------- */
+const HEAD='M-72,-6 C-72,-62 -40,-84 0,-84 C42,-84 72,-60 72,-4 C72,54 40,88 0,88 C-40,88 -72,54 -72,-6Z';
+const HAIR='M-78,-8 C-92,-100 -30,-104 0,-100 C46,-104 92,-92 78,-6 C62,-52 34,-62 0,-60 C-34,-62 -60,-52 -78,-8Z';
+const Head = ({ex='neutral',t=0,m=0,skin=C.sk,hair=C.b2,scar=false,lk=0,lh=false}:any)=>{
+  const bl=(t%130)<6?.15:1;
+  const eye=(s:number)=>{
+    let rx=12,ry=10,pr=4.5;
+    if(ex==='scared'){rx=18;ry=21;pr=3.5} if(ex==='grin'){rx=20;ry=20;pr=3} if(ex==='angry'){rx=13;ry=7}
+    return <g key={s} transform={`translate(${s*30},-6)`}><ellipse rx={rx} ry={ry*bl} fill={C.bone} {...OL} strokeWidth={ex==='grin'?7:3}/>
+      <circle cx={lk*4} r={pr} fill={C.n0}/></g>;
+  };
+  const by:any={neutral:[-34,-34],scared:[-46,-62],angry:[-40,-18],sad:[-32,-48],smile:[-36,-38],grin:[-56,-58]};
+  const [bo,bi]=by[ex]||by.neutral;
+  let mouth:any;
+  if(ex==='neutral') mouth=m>.05?<ellipse cx={0} cy={46} rx={12} ry={4+m*14} fill={C.n0}/>:<path d="M-18,46 Q0,48 18,46" {...OL} fill="none"/>;
+  if(ex==='smile') mouth=<path d="M-26,38 Q0,60 26,38" {...OL} fill="none"/>;
+  if(ex==='sad') mouth=<path d="M-20,52 Q0,36 20,52" {...OL} fill="none"/>;
+  if(ex==='scared') mouth=<ellipse cx={0} cy={50} rx={15} ry={12+m*14} fill={C.n0} {...OL} strokeWidth={3}/>;
+  if(ex==='angry') mouth=<path d="M-28,40 L28,40 L24,60 L-24,60Z M-9,40V60 M9,40V60" fill={C.bone} {...OL} strokeWidth={3}/>;
+  if(ex==='grin') mouth=<g><path d={`M-66,14 Q0,${34} 66,14 Q0,${92+m*34} -66,14Z`} fill={C.n0} {...OL}/>
+    <path d="M-58,20 Q0,40 58,20 L54,34 Q0,56 -54,34Z" fill={C.bone}/>
+    <path d="M-30,30V47M-10,34V52M10,34V52M30,30V47" stroke={C.n0} strokeWidth={3}/>
+    <path d="M-66,14 l-9,-12 M66,14 l9,-12" {...OL} strokeWidth={4}/></g>;
+  return <g><path d={HEAD} fill={skin} {...OL}/><path d="M44,-80 C82,-40 80,44 42,84 C70,48 68,-48 44,-80Z" fill={C.n0} opacity={.28}/>
+    {scar&&<g opacity={.4}><ellipse cx={-34} cy={30} rx={24} ry={17} fill="#5a3a32"/><ellipse cx={38} cy={-30} rx={18} ry={26} fill="#5a3a32"/><path d="M-60,-30 q20,20 8,50" stroke="#3b2420" strokeWidth={6} fill="none"/></g>}
+    {eye(-1)}{eye(1)}
+    {ex!=='grin'&&[-1,1].map(s=><path key={s} d={`M${s*46},${bo} L${s*14},${bi}`} {...OL} strokeWidth={7}/>)}
+    {mouth}<path d={HAIR} fill={hair} {...OL}/>
+    {lh&&<path d="M-78,-20 L-88,76 L-58,76 L-64,-20Z M78,-20 L88,76 L58,76 L64,-20Z" fill={hair} {...OL}/>}</g>;
+};
+const Person = ({x,y,s=1.4,skin=C.sk,hair=C.b2,cloth=C.n3,pants=C.n2,ex='neutral',t=0,m=0,flip=false,arm=[8,-8],tilt=0,lk=0,scar=false,rot=0,ph=0,lh=false,children}:any)=>{
+  const br=Math.sin((t+ph)/16)*3, hd=Math.sin((t+ph)/37)*2+tilt;
+  return <g transform={`translate(${x},${y}) rotate(${rot}) scale(${flip?-s:s},${s})`}>
+    <ellipse cy={6} rx={96} ry={13} fill="#02040a" opacity={.5}/>
+    {[-1,1].map(k=><path key={k} d={`M${k*42-22},-120 L${k*44-20},-8 L${k*44+20},-8 L${k*42+22},-120Z`} fill={pants} {...OL}/>)}
+    {[-1,1].map(k=><ellipse key={k} cx={k*50} cy={-4} rx={30} ry={13} fill={C.n0}/>)}
+    <path d="M-64,-292 Q0,-314 64,-292 L72,-110 L-72,-110Z" fill={cloth} {...OL}/>
+    {[-1,1].map((k,i)=><g key={k} transform={`translate(${k*64},-280) rotate(${arm[i]})`}>
+      <path d={`M0,0 L${k*14},118`} stroke={C.n0} strokeWidth={40} strokeLinecap="round"/>
+      <path d={`M0,0 L${k*14},118`} stroke={cloth} strokeWidth={30} strokeLinecap="round"/>
+      <circle cx={k*14} cy={130} r={17} fill={skin} {...OL} strokeWidth={4}/></g>)}
+    <rect x={-18} y={-330} width={36} height={44} fill={skin} {...OL}/>
+    <g transform={`translate(0,${-372+br}) rotate(${hd})`}><Head ex={ex} t={t} m={m} skin={skin} hair={hair} scar={scar} lk={lk} lh={lh}/></g>
+    {children}</g>;
+};
+const Knife = ({x,y,r=0}:any)=><g transform={`translate(${x},${y}) rotate(${r})`}><rect x={-7} y={-6} width={14} height={34} fill={C.b2} {...OL} strokeWidth={3}/>
+  <path d="M-9,-6 L9,-6 L4,-120 Z" fill="#d7d9de" {...OL} strokeWidth={3}/><path d="M0,-30 L0,-110" stroke="#fff" strokeWidth={3} opacity={.8}/></g>;
+const JEFF:any = {skin:SK,hair:'#09090c',cloth:C.n3,pants:C.n1};
+const SIL:any = {skin:'#07090f',hair:C.blk,cloth:C.blk,pants:C.blk};
 
-def s_boing():
-    t = tt(.5); f = 250 + 500 * np.exp(-9 * t) + 90 * np.sin(2 * np.pi * 16 * t) * np.exp(-5 * t)
-    return np.sin(np.cumsum(2 * np.pi * f / SR)) * np.exp(-4 * t)
-def s_thump(): return mx(slide(150, 40, .2, 16), noise(.02, 100, 3) * .5)
-def s_step(): return slide(120, 60, .1, 30) * .7
-def s_zip(): return mx(noise(.2, 0, 5) * hann(.2) * 1.2, slide(300, 2400, .15, 6) * .25)
-def s_pluck(f): return mx(sine(f, .22, 14), .4 * sine(2 * f, .22, 20))
-def s_gulp(): return slide(420, 140, .12, 12)
-def s_creak():
-    d = .6; t = tt(d); f = 220 + 140 * t / d + 25 * np.sin(2 * np.pi * 23 * t)
-    s = ((np.cumsum(f) / SR) % 1) * 2 - 1
-    return lp(s, 5) * hann(d) * (.6 + .4 * np.abs(np.sin(2 * np.pi * 9 * t)))
-def s_trickle(d):
-    n = int(d * SR); out = lp(rng.standard_normal(n), 3) * .22
-    for _ in range(int(d * 28)):
-        b = sine(rng.uniform(500, 1500), .05, 60) * .5; i = rng.integers(0, max(1, n - len(b)))
-        out[i:i + len(b)] += b[:max(0, n - i)][:len(b)] if i + len(b) <= n else b[:n - i]
-    return out * np.minimum(1, np.minimum(tt(d) * 15, (d - tt(d)) * 15))
-def s_sniff(): d = .14; return (noise(d, 0, 0, 8)) * hann(d) * .9
-def s_gag(): return slide(320, 80, .4, 4, True, .05)
-def s_whistle():
-    out = np.zeros(int(1.1 * SR))
-    for i, f in enumerate((1318, 1480, 1568, 1760)):
-        s = slide(f, f * 1.04, .22, 2, vib=.01) * hann(.22) * .5; o = int(i * .26 * SR); out[o:o + len(s)] += s
-    return out
-def s_dundun():
-    a, b = sine(98, .4, 5) + sine(196, .4, 7) * .4, sine(87, .6, 4) + sine(174, .6, 6) * .4
-    out = np.zeros(int(1 * SR)); out[:len(a)] += a; o = int(.3 * SR); out[o:o + len(b)] += b; return out
-def s_bark(): return mx(slide(560, 230, .14, 14, True), noise(.1, 25, 3) * .4)
-def s_poof(): return mx(noise(.3, 9, 5), sine(180, .2, 15) * .5)
-def s_ding(): return mx(sine(1760, .7, 5), .5 * sine(2637, .5, 7))
-def s_bonk(): return mx(sine(880, .12, 35), .5 * sine(1320, .1, 45), s_thump() * .5)
-def s_cricket():
-    out = np.zeros(int(.35 * SR))
-    for j in range(4): s = sine(4300, .035, 35); o = int(j * .06 * SR); out[o:o + len(s)] += s
-    return out
-def s_trombone():
-    out = np.zeros(int(2.2 * SR)); o = 0
-    for f0, f1, d in ((233, 220, .38), (220, 208, .38), (208, 196, .38), (196, 140, .55)):
-        s = slide(f0, f1, d, 1.2, True, .03) * np.minimum(1, tt(d) * 30); out[o:o + len(s)] += s; o += int((d + .02) * SR)
-    return out
+type SP = {t:number;p:number;f:number;e:number};
 
-def s_heart(): return mx(slide(70, 40, .22, 12), sine(110, .15, 25) * .4)
-def s_riser(d):
-    n = int(d * SR); t = tt(d); f = 70 * (1100 / 70) ** (t / d)
-    nz = (rng.standard_normal(n) - lp(rng.standard_normal(n), 4)) * .35
-    return (np.sin(np.cumsum(2 * np.pi * f / SR)) * .8 + nz) * np.linspace(0, 1, n) ** 2.2
-def s_scream(d=1.22):
-    t = tt(d); n = len(t)
-    f = 700 + 500 * (1 - np.exp(-6 * t)) + 45 * np.sin(2 * np.pi * 55 * t) + lp(rng.standard_normal(n), 900) * 500
-    ph = np.cumsum(2 * np.pi * f / SR)
-    sig = sum(((ph * r / (2 * np.pi)) % 1) * 2 - 1 for r in (1, 1.007, 1.5, 2.01)) / 4
-    sig = np.tanh(sig * 5) * np.minimum(1, t * 80) * (1 - .2 * t / d) + rng.standard_normal(n) * .5 * np.exp(-2 * t)
-    return np.tanh(sig * 2.5)
-def s_boom(): return mx(slide(130, 28, 1.2, 2.2) * 1.3, noise(.5, 5, 10) * 1.2)
-def s_dbark(): return np.tanh(s_bark() * 6)
-def s_ring(): return sine(6200, .8, 3) * .25
+/* ---------- S1: the intruder at the window ---------- */
+const S1 = ({t,p,f}:SP)=>{
+  const gap=lp(34,68,p), fy=lp(570,510,p), fs=lp(.8,1.2,p);
+  return <g><Room/><Win x={380} y={260} w={320} h={470}/>
+    <g transform={`translate(540,${fy}) scale(${fs})`}><ellipse rx={84} ry={100} fill="#c4beb1" {...OL}/>
+      {[-1,1].map(s=><g key={s}><ellipse cx={s*32} cy={-14} rx={24} ry={18} fill={C.n0}/><circle cx={s*32} cy={-14} r={4} fill={C.bone}/></g>)}
+      <path d={`M-62,34 Q0,${84+Math.sin(t/20)*5} 62,34 Q0,52 -62,34Z`} fill={C.n0} {...OL}/>
+      <path d="M-52,38 Q0,64 52,38 L48,46 Q0,70 -48,46Z" fill={C.bone}/></g>
+    <path d={`M330,250H${540-gap}Q${520-gap},500 ${540-gap},740H330Z`} fill={C.b2} {...OL}/>
+    <path d={`M750,250H${540+gap}Q${560+gap},500 ${540+gap},740H750Z`} fill={C.b2} {...OL}/>
+    <rect x={320} y={236} width={460} height={16} fill={C.b1} {...OL}/>
+    <Dresser x={40} y={1180}/><Lamp x={150} y={1180} f={f}/>
+    <Wood x={990} y={980} w={60} h={450} g={5}/>
+    <Person x={720} y={1340} s={1.15} ex={p<.22?'neutral':'scared'} t={t} lh={false} cloth={C.pale} lk={-1}/>
+    <path d="M400,1270 Q700,1226 1000,1276 L1000,1430 L400,1430Z" fill={C.n3} {...OL}/>
+    <Sh x={720} y={1440} L={-520} w={120}/>
+    <Dark x={150} y={1130} r={1150} a={.82} id="d1"/>
+    {p>.9&&<Flash t={t} a={sg(p,.9,.96)}/>}</g>;
+};
 
-def make_music(n):
-    t_end = n / SR; beat = 60 / 112; out = np.zeros(n)
-    sc = [261.63, 293.66, 329.63, 392.0, 440.0, 523.25, 587.33, 659.25]
-    mel = [0, 2, 4, 2, 5, 4, 2, 1, 0, 2, 4, 5, 7, 5, 4, 2]; bass = [130.8, 196.0, 220.0, 174.6]
-    def put(sig, t0, g):
-        i = int(t0 * SR)
-        if i < n: seg_ = sig[:n - i]; out[i:i + len(seg_)] += seg_ * g
-    for i in range(int(t_end / (beat / 2)) + 1):
-        t0 = i * beat / 2
-        f = sc[mel[i % 16]]; put(mx(sine(f, .35, 7), .3 * sine(4 * f, .35, 18)), t0, .5)
-        if i % 2 == 0: put(sine(bass[(i // 8) % 4], .4, 5) * .9, t0, .6)
-        else: put(noise(.04, 60, 0, 4), t0, .12)
-    return out
+/* ---------- S2: the new neighbourhood ---------- */
+const S2 = ({t,p,f}:SP)=>{
+  const fam=[{x:170,ex:'neutral',c:C.b3,s:1.35},{x:330,ex:'smile',c:C.n3,s:1.25,lh:true},{x:500,ex:'sad',c:C.n2,s:1.1,tilt:6,lk:-1,jeff:true},{x:640,ex:'smile',c:C.b1,s:.95}];
+  return <g><rect width={W} height={1340} fill="url(#wall)"/>
+    {[[100,160],[300,90],[640,200],[780,120],[980,60],[420,300]].map((s,i)=><circle key={i} cx={s[0]} cy={s[1]} r={3} fill={C.pale} opacity={.7}/>)}
+    <circle cx={860} cy={250} r={90} fill={C.pale} opacity={.9}/><Glow x={860} y={250} r={400} a={.25}/>
+    <polygon points="90,640 540,330 990,640" fill={C.n2} {...OL}/><Wood x={130} y={640} w={820} h={700} g={10}/>
+    {[200,640].map(x=><g key={x}><rect x={x} y={730} width={190} height={220} fill={C.y} opacity={.55+f*.35} {...OL}/><path d={`M${x+95},730V950M${x},840H${x+190}`} stroke={C.b2} strokeWidth={7}/></g>)}
+    <rect x={470} y={1030} width={140} height={310} fill={C.b2} {...OL}/><circle cx={590} cy={1190} r={8} fill={C.y2}/>
+    <Glow x={540} y={1000} r={260} a={.25*f}/>
+    <rect y={1340} width={W} height={H-1340} fill={C.n1}/>
+    <Wood x={50} y={1270} w={130} h={110} g={2}/><Wood x={130} y={1200} w={100} h={80} g={2}/>
+    {fam.map((m:any,i)=><React.Fragment key={i}><Sh x={m.x} y={1750} L={-340} w={60}/>
+      <Person x={m.x} y={1750} s={m.s} ex={m.ex} cloth={m.c} t={t} ph={i*20} lh={m.lh} tilt={m.tilt||0} lk={m.lk||0} {...(m.jeff?{skin:SK,hair:JEFF.hair}:{})}/></React.Fragment>)}
+    <Sh x={940} y={1750} L={-340} w={60}/>
+    <Person x={940} y={1750} s={1.2} flip ex="smile" cloth="#6f5b4a" lh hair={C.b3} arm={[0,-80]} t={t}/>
+    <g transform="translate(705,1415) rotate(-10)"><rect x={-36} y={-26} width={72} height={52} fill={C.pale} {...OL}/><path d="M-36,-26 L0,6 L36,-26" fill="none" {...OL} strokeWidth={3}/></g>
+    <Dark x={540} y={1000} r={1400} a={.72} id="d2"/></g>;
+};
 
-def build_mix(x, total, pauses, bounds, holds):
-    n = int(total / FPS * SR); A = bounds[5] / FPS; An = int(A * SR)
-    narr = np.zeros(n); m_ = min(n, len(x)); narr[:m_] = x[:m_]
-    env = lp(np.abs(narr), int(.15 * SR)); env = np.clip(env / (np.percentile(env, 98) + 1e-9), 0, 1)
-    gate = np.ones(n)
-    for ps, pe in pauses: gate[int(ps * SR):int(pe * SR)] = 0
-    gate[An:] = 0; gate = lp(gate, int(.06 * SR))
-    pkn = np.percentile(np.abs(narr[:An]), 99.8) + 1e-9
-    narr = narr * (.85 / pkn)                       # voice = loudest element
-    music = make_music(n) * .09 * (1 - .6 * env) * gate
-    sfx = np.zeros(n)                               # SFX bus: quiet, ducked while the voice speaks
-    starts = [b / FPS for b in bounds[:5]]; acts = [h[0] / FPS for h in holds[:5]]
-    def at(k, u): return starts[k] + u * (acts[k] - starts[k])
-    def put(sig, t0, g=1.0):
-        i = int(max(0, t0) * SR)
-        if i < n: s_ = sig[:n - i]; sfx[i:i + len(s_)] += s_ * g
-    for k in range(5):
-        put(s_zip(), at(k, 0), .35); put(s_bonk(), acts[k], .55)
-    for u in (.25, .5, .75, .98): put(s_thump(), at(0, u), .9)
-    put(s_boing(), at(0, .07), .5)
-    put(slide(700, 1500, .8, 0) * hann(.8), at(0, .3), .18)
-    for u, f in zip((.05, .11, .17, .23, .29, .35, .41), (523, 494, 466, 440, 466, 440, 392)): put(s_pluck(f), at(1, u), .45)
-    for u in (.15, .31): put(s_gulp(), at(1, u), .5)
-    put(s_creak(), at(1, .42), .5); put(s_boing(), at(1, .54), .45); put(s_thump(), at(1, .63), .7)
-    put(s_trickle(.24 * (acts[1] - starts[1])), at(1, .64), .55); put(s_ding(), at(1, .9), .4)
-    for u in (.04, .10, .16, .22): put(s_step(), at(2, u), .5)
-    for u in (.313, .38, .447): put(s_sniff(), at(2, u), .7)
-    put(s_gag(), at(2, .5), .4); put(s_zip(), at(2, .22), .3); put(s_zip(), at(2, .58), .3)
-    put(s_whistle(), at(2, .56), .25)
-    for u in (.64, .70): put(s_sniff(), at(2, u), .5)
-    put(s_boing(), at(2, .83), .45)
-    put(s_trickle(.28 * (acts[3] - starts[3])), at(3, .02), .55); put(s_dundun(), at(3, .30), .55)
-    put(s_boing(), at(3, .58), .4); put(s_poof(), at(3, .63), .3)
-    for u in (.70, .78): put(s_bark(), at(3, u), .6)
-    put(s_poof(), at(4, .15), .6)
-    for u in np.linspace(.30, .80, 9): put(s_cricket(), at(4, u), .22)
-    put(s_zip(), at(4, .56), .3); put(s_trombone(), at(4, .60), .5); put(s_zip(), at(4, .93), .3)
-    mix = narr + music + sfx * SFX_LEVEL * (1 - .5 * env)
-    pk = np.abs(mix[:An]).max()
-    if pk > .97: mix *= .97 / pk
-    mix[An:] = 0; fo = int(.03 * SR); mix[An - fo:An] *= np.linspace(1, 0, fo)
-    def put(sig, t0, g=1.0):                         # scare hits go straight to the mix at full level
-        i = int(max(0, t0) * SR)
-        if i < n: s_ = sig[:n - i]; mix[i:i + len(s_)] += s_ * g
-    # ---- jumpscare (after narration): heartbeat + riser -> silence -> scream/boom/barks -> hard cut
-    for d in (.2, .36, .7, .83, 1.0, 1.1): put(s_heart(), A + d, .9)
-    put(s_riser(.87), A + .25, .35)
-    put(s_scream(), A + 1.28, 1.0); put(s_boom(), A + 1.28, 1.0)
-    for d in (.5, .85, 1.1): put(s_dbark(), A + 1.28 + d, .8)
-    put(s_ring(), A + 2.5, .3)
-    return np.clip(mix, -1, 1)
+/* ---------- S3: the bus stop ---------- */
+const S3 = ({t,p,f}:SP)=>{
+  const ja=sg(p,.35,.55), ret=sg(p,.5,.72), cop=sg(p,.74,.92);
+  const bx=(k:number,x:number)=>lp(1300,x,sg(p,0,.12))+lp(0,90,ret);
+  return <g><rect width={W} height={1380} fill="url(#wall)"/>
+    {[[0,700,230],[250,560,200],[480,760,240],[760,620,180],[900,820,200]].map((b,i)=><g key={i}><rect x={b[0]} y={b[1]} width={b[2]} height={1380-b[1]} fill={C.n1} {...OL}/>
+      {[0,1,2].map(j=><rect key={j} x={b[0]+30+j*60} y={b[1]+50+(i%2)*70} width={30} height={40} fill={C.y} opacity={.35}/>)}</g>)}
+    <rect y={1380} width={W} height={H-1380} fill={C.b2}/><rect y={1380} width={W} height={26} fill={C.b1} {...OL}/>
+    <rect x={190} y={800} width={14} height={580} fill={C.pale} {...OL}/><rect x={130} y={760} width={130} height={80} fill={C.y2} {...OL}/>
+    <path d="M880,1380 V560 Q880,520 820,520" stroke={C.n3} strokeWidth={16} fill="none" {...OL}/>
+    <polygon points="780,540 860,540 1000,1380 640,1380" fill={C.y} opacity={.1}/><Glow x={810} y={560} r={420} a={.55*f}/>
+    <ellipse cx={810} cy={532} rx={42} ry={16} fill={C.y} {...OL}/>
+    {[{x:bx(0,560),y:1640,c:C.b3},{x:bx(1,760),y:1700,c:C.n2},{x:bx(2,930),y:1650,c:C.b1}].map((b,i)=><React.Fragment key={i}>
+      <Sh x={b.x} y={b.y} L={-380} w={60}/>
+      <Person x={b.x} y={b.y} s={1.3} flip ex={ret>.3?'scared':'smile'} cloth={b.c} hair={i?C.b2:C.n0} t={t} ph={i*30} arm={i===1?[0,-80]:[8,-8]}>
+        {i===1&&p>.12&&p<.72&&<g><Knife x={194} y={-271} r={90}/><path d="M290,-290 l16,-16 M290,-290 l-16,-16 M290,-290 l16,16" stroke="#fff" strokeWidth={4} opacity={.5+.5*Math.sin(t/3)}/></g>}</Person></React.Fragment>)}
+    <Sh x={140} y={1640} L={-380} w={60}/><Person x={lp(140,-300,cop)} y={1640} s={1.05} ex={cop>0?'sad':'scared'} cloth={C.b1} hair={C.b3} t={t}/>
+    <Sh x={340} y={1710} L={-380} w={60}/>
+    <Person x={lp(340,500,ja)} y={1710} s={1.4} ex={ja>.2?'angry':'neutral'} {...JEFF} tilt={ja*-4} t={t} scar={false} arm={[ja*20,-ja*20]}/>
+    {cop>0&&<Person x={lp(-250,-40,cop)} y={1650} s={1.35} ex="neutral" cloth={C.blk} pants={C.blk} hair={C.n0} t={t}/>}
+    <Dark x={600} y={1100} r={1400} a={.75} id="d3"/>{p>.72&&<Flash t={t} a={sg(p,.72,.8)}/>}</g>;
+};
 
+/* ---------- S4: birthday party & fire ---------- */
+const Fire = ({t,k}:any)=><g>{Array.from({length:9}).map((_,i)=>{const x=(i+.5)*W/9,h=(300+Math.sin(t/5+i*2)*80+Math.sin(t/3+i)*45)*k;
+  return <g key={i}><path d={`M${x-90},${H} Q${x-60},${H-h*.6} ${x+Math.sin(t/4+i)*24},${H-h} Q${x+66},${H-h*.5} ${x+90},${H}Z`} fill={C.amb} opacity={.88}/>
+  <path d={`M${x-48},${H} Q${x-30},${H-h*.4} ${x},${H-h*.62} Q${x+34},${H-h*.35} ${x+48},${H}Z`} fill={C.y}/></g>})}</g>;
+const S4 = ({t,p,f}:SP)=>{
+  const ent=sg(p,.28,.42), ch=sg(p,.45,1), fire=sg(p,.62,.9), fall=sg(p,.74,.9);
+  const sh=Math.sin(t*1.9)*10*ch;
+  return <g transform={`translate(${sh},${Math.cos(t*2.3)*6*ch})`}><Room/>
+    <path d="M0,200 Q270,330 540,200 T1080,200" stroke={C.y2} strokeWidth={4} fill="none"/>
+    {Array.from({length:9}).map((_,i)=>{const x=i*120+40,y=205+105*Math.sin(Math.PI*(x%540)/540);return <polygon key={i} points={`${x-24},${y} ${x+24},${y} ${x},${y+54}`} fill={[C.y,C.b3,C.n3][i%3]} {...OL} strokeWidth={3}/>})}
+    {[[120,520,C.y2],[960,560,C.n3],[200,740,C.b3],[900,780,C.y]].map((b:any,i)=><g key={i}><path d={`M${b[0]},${b[1]+64} q${Math.sin(t/20+i)*20},120 0,260`} stroke={C.pale} strokeWidth={2} fill="none"/><ellipse cx={b[0]} cy={b[1]} rx={52} ry={64} fill={b[2]} {...OL}/></g>)}
+    <Wood x={330} y={1250} w={420} h={150} g={3}/><rect x={430} y={1170} width={220} height={82} fill={C.pale} {...OL}/><rect x={430} y={1170} width={220} height={26} fill={C.b3} {...OL}/>
+    {[470,540,610].map(x=><g key={x}><rect x={x-4} y={1128} width={8} height={42} fill={C.y2}/><ellipse cx={x} cy={1112} rx={9} ry={16+Math.sin(t/4+x)*3} fill={C.y}/></g>)}
+    <Glow x={540} y={1180} r={300} a={.4*f}/>
+    {[170,350,760].map((x,i)=><Person key={i} x={x-lp(0,620,ch)} y={1640+i*40} s={.95} ex={ch>.1?'scared':'smile'} cloth={[C.b3,C.n2,C.b1][i]} t={t} ph={i*25} m={ch}/>)}
+    {[560,700,800].map((x,i)=><Person key={i} x={lp(1350,x,ent)} y={1620+i*50} s={1.3} flip ex="angry" cloth={[C.b1,C.n2,C.b3][i]} t={t} ph={i*17} arm={[ch*40,-ch*40]}/>)}
+    <Person x={930} y={1680} s={1.35} rot={lp(0,78,fall)} ex={fall>.1?'scared':ch>.1?'angry':'neutral'} {...JEFF} t={t}/>
+    {fire>0&&<><Fire t={t} k={fire}/><Glow x={540} y={H} r={1100} a={fire*.55} c="gl2"/></>}
+    <Dark x={540} y={1000} r={1500} a={.72-fire*.3} id="d4"/></g>;
+};
 
-def write_wav(path, mono):
-    pcm = (np.clip(mono, -1, 1) * 32767).astype("<i2")
-    with wave.open(str(path), "wb") as w:
-        w.setnchannels(2); w.setsampwidth(2); w.setframerate(SR)
-        w.writeframes(np.repeat(pcm[:, None], 2, 1).tobytes())
+/* ---------- S5: hospital, bandages off ---------- */
+const S5 = ({t,p,f,e}:SP)=>{
+  const unb=sg(p,.3,.45), lau=sg(p,.52,.62), ex=lau>0?'grin':'neutral';
+  return <g><Room/>
+    <ellipse cx={850} cy={640} rx={135} ry={195} fill={C.n3} {...OL} strokeWidth={14} stroke={C.b3}/>
+    <g opacity={sg(p,.42,.52)} transform="translate(850,650) scale(1.1)"><Head ex="grin" t={t} m={.5+.5*Math.sin(t/3)} skin={SK} hair={JEFF.hair} scar/></g>
+    <path d="M160,1330 V520 H320" stroke={C.pale} strokeWidth={8} fill="none"/><rect x={285} y={520} width={70} height={110} rx={12} fill={C.y2} opacity={.7} {...OL}/>
+    <Wood x={120} y={1330} w={840} h={60} c={C.b3}/><rect x={140} y={1230} width={800} height={110} fill="#7d8794" {...OL}/>
+    <Person x={540} y={1370} s={1.5} ex={ex} {...JEFF} skin={SK} cloth="#8b95a3" t={t} scar={unb>.5} m={lau*(.4+.6*Math.abs(Math.sin(t/3)))} tilt={lau*Math.sin(t/2.2)*5}/>
+    <path d="M150,1330 Q540,1290 930,1340 L930,1440 L150,1440Z" fill="#a7b0bd" {...OL}/>
+    <g opacity={1-unb} transform={`translate(0,${-unb*420})`}><ellipse cx={540} cy={805} rx={120} ry={128} fill={C.pale} {...OL}/>
+      {[0,1,2].map(i=><path key={i} d={`M${440+i*10},${740+i*45} Q540,${770+i*45} ${640-i*10},${740+i*45}`} stroke={C.b3} strokeWidth={4} fill="none"/>)}
+      <rect x={470} y={840} width={140} height={60} fill={C.pale} {...OL}/></g>
+    <Sh x={130} y={1790} L={420} w={60}/>
+    <Person x={130} y={1790} s={1.3} ex={lau>0?'scared':'neutral'} cloth={C.pale} pants={C.n2} t={t} hair={C.b2}/>
+    <Person x={950} y={1790} s={1.3} flip ex={lau>0?'scared':'sad'} cloth="#6f6a66" lh hair={C.b3} t={t} m={lau}/>
+    <Lamp x={540} y={1390} f={0}/><Dark x={540} y={900} r={1200} a={.78} id="d5"/></g>;
+};
 
+/* ---------- S6: bathroom ---------- */
+const S6 = ({t,p,f,e}:SP)=>{
+  const mx=lp(180,80,sg(p,.4,1));
+  return <g><rect width={W} height={1400} fill={C.n2}/>
+    {Array.from({length:10}).map((_,i)=><path key={i} d={`M${i*120},0V1400M0,${i*150}H${W}`} stroke={C.n0} strokeWidth={3} opacity={.35}/>)}
+    <rect y={1400} width={W} height={H-1400} fill={C.n1}/>
+    <polygon points="0,300 250,420 250,1390 0,1500" fill={C.y} opacity={.2+e*.05}/><polygon points="0,1480 0,1920 960,1920 420,1470" fill={C.y} opacity={.13}/>
+    <rect x={390} y={520} width={300} height={430} fill={C.n3} {...OL} strokeWidth={14} stroke={C.b3}/>
+    <g transform="translate(540,760) scale(.9)"><Head ex="grin" t={t} m={e} skin={SK} hair={JEFF.hair} scar/></g>
+    <rect x={380} y={1150} width={320} height={210} fill="#8f9aa8" {...OL}/><rect x={500} y={1100} width={80} height={50} fill={C.b3} {...OL}/>
+    <Sh x={620} y={1690} L={470} w={110}/><Sh x={mx} y={1690} L={470} w={80}/>
+    <Person x={620} y={1690} s={1.7} ex="grin" {...JEFF} scar m={Math.min(1,e*1.4)} t={t} tilt={Math.sin(t/25)*5}/>
+    <Person x={mx} y={1690} s={1.45} ex="scared" cloth="#6f6a66" pants="#4a4a52" lh hair={C.b3} t={t} m={e}/>
+    <Dark x={560} y={1000} r={1250} a={.8} id="d6"/></g>;
+};
 
-# ----------------------------------------------------------------------------- main
-def main():
-    if "--clean" in sys.argv: shutil.rmtree(DIR / "render_cache", ignore_errors=True); print("render cache cleared")
-    P.start(0)
-    node, npm = shutil.which("node"), shutil.which("npm")
-    if not PREP and not (node and npm): sys.exit("\nNode.js/npm not found. Install Node 18+ from nodejs.org")
-    if not AUDIO.exists():
-        alt = Path(__file__).parent / "20204.mp3"
-        if alt.exists(): DIR.mkdir(parents=True, exist_ok=True); shutil.copy(alt, AUDIO)
-        else: sys.exit(f"\nMissing audio: {AUDIO}")
-    P.done("node/npm/audio OK")
+/* ---------- S7: corridor, light goes out ---------- */
+const S7 = ({t,p,f,e}:SP)=>{
+  const a=sg(p,.35,.85), lamp=1-sg(p,.55,.9), run=sg(p,.05,.5), sw=Math.sin(t/4);
+  return <g><rect width={W} height={H} fill={C.n1}/>
+    <polygon points="0,0 260,420 260,1380 0,1920" fill={C.b2} {...OL}/><polygon points="1080,0 820,420 820,1380 1080,1920" fill={C.b2} {...OL}/>
+    <rect x={260} y={420} width={560} height={960} fill={C.n2} {...OL}/>
+    <polygon points="0,1920 260,1380 820,1380 1080,1920" fill={C.b1}/>
+    {Array.from({length:7}).map((_,i)=><path key={i} d={`M540,1380 L${i*180},1920`} stroke={C.b2} strokeWidth={4}/>)}
+    <rect x={400} y={640} width={280} height={740} fill={C.y} opacity={.9*lamp} {...OL}/>
+    <polygon points="400,1380 680,1380 960,1920 120,1920" fill={C.y} opacity={.22*lamp}/><Glow x={540} y={1000} r={640} a={.5*lamp}/>
+    <polygon points={`${540-90*lp(1,2.6,a)},${lp(1380,1700,a)} ${540+90*lp(1,2.6,a)},${lp(1380,1700,a)} ${540+500*a},1920 ${540-500*a},1920`} fill="#02040a" opacity={.6} filter="url(#bl)"/>
+    <Person x={540} y={lp(1380,1620,a)} s={lp(.85,1.7,a)} ex="grin" {...SIL} arm={[0,-150]} t={t} m={Math.min(1,e*1.2)}><Knife x={117} y={-400} r={8}/></Person>
+    <Person x={lp(780,-260,run)} y={1760-Math.abs(sw)*16} s={1.25} flip ex="scared" cloth="#6f6a66" lh hair={C.b3} arm={[sw*45,-sw*45]} t={t}/>
+    <Dark x={540} y={1100} r={lp(1500,420,sg(p,.5,.95))} a={.9} id="d7"/></g>;
+};
 
-    P.start(1)
-    (PROJ / "src").mkdir(parents=True, exist_ok=True); (PROJ / "public").mkdir(exist_ok=True)
-    for name, txt in (("src/Art.jsx", ART), ("src/Main.jsx", MAIN), ("src/index.jsx", INDEX), ("src/Root.jsx", ROOT), ("render.js", RENDER_JS)):
-        (PROJ / name).write_text(txt, encoding="utf-8")
-    if not (PROJ / "package.json").exists(): (PROJ / "package.json").write_text('{"name":"cnd","private":true}', encoding="utf-8")
-    P.done("6 source files")
+/* ---------- S8: Liu, the whisper, police lights fade ---------- */
+const S8 = ({t,p,f}:SP)=>{
+  const ap=sg(p,.15,.45), hand=sg(p,.45,.58), q=sg(p,.6,.95), gone=1-sg(p,.6,.7);
+  return <g><Room/><Win x={60} y={260} w={300} h={460}/>
+    {q>0&&<g opacity={1-sg(q,.75,1)}><circle cx={lp(90,330,q)} cy={540} r={lp(60,14,q)} fill={(Math.floor(t/9)%2)?'#3b5bc4':'#a13a40'} opacity={.9}/>
+      <Glow x={lp(90,330,q)} y={540} r={lp(260,70,q)} a={.5} c={(Math.floor(t/9)%2)?'glb':'glr'}/></g>}
+    <Dresser x={40} y={1180} w={260}/>
+    <Wood x={960} y={980} w={60} h={450} g={5}/>
+    <g opacity={gone}><Person x={650} y={1340} s={1.2} ex="scared" t={t} cloth={C.pale} lk={1} m={1-hand}/>
+    <path d="M360,1270 Q660,1230 960,1276 L960,1430 L360,1430Z" fill={C.n3} {...OL}/>
+    <Person x={lp(1050,780,ap)} y={1500} s={1.9} flip ex="grin" {...SIL} t={t} arm={[0,-8]} m={.3}/>
+    <g transform={`translate(${lp(840,655,hand)},${lp(1080,905,hand)}) rotate(-20)`} opacity={sg(p,.45,.5)}><ellipse rx={74} ry={50} fill={C.blk}/>{[-48,-16,16,44].map(x=><ellipse key={x} cx={x} cy={-48} rx={14} ry={30} fill={C.blk}/>)}</g></g>
+    <Dark x={lp(650,210,sg(p,.55,.8))} y={lp(1000,520,sg(p,.55,.8))} r={lp(1250,620,sg(p,.55,.8))} a={.9} id="d8"/></g>;
+};
 
-    P.start(2)
-    if PREP: P.done("skipped (--prep)")
-    elif (PROJ / "node_modules" / "remotion").exists(): P.done("already installed")
-    else:
-        P.line(.1, "npm install (1-3 min)...")
-        run([npm, "install", "--no-audit", "--no-fund", "--loglevel=error", "remotion@^4", "@remotion/bundler@^4",
-             "@remotion/renderer@^4", "@remotion/cli@^4", "react@18", "react-dom@18"], cwd=PROJ)
-        P.done()
+const SC = [S1,S2,S3,S4,S5,S6,S7,S8];
+const ORG = [[540,560],[540,1100],[620,1400],[700,1300],[540,860],[600,1200],[540,1100],[420,700]];
 
-    P.start(3)
-    raw = PROJ / "pcm.raw"; P.line(.2, "decoding mp3")
-    x = decode_pcm(str(AUDIO), str(raw)); raw.unlink(missing_ok=True)
-    dur = len(x) / SR; atotal = math.ceil(dur * FPS); total = atotal + SCARE
-    P.line(.6, "finding pauses")
-    pauses = find_pauses(x, dur)
-    bounds = [0] + [round(pe * FPS) for _, pe in pauses] + [atotal, total]
-    holds = []
-    for k, (ps, pe) in enumerate(pauses):
-        b = bounds[k + 1]; a = min(max(round((ps + .12) * FPS), bounds[k] + 30), b - 6); holds.append([a, b])
-    holds.append([max(atotal - 54, bounds[4] + 30), atotal]); holds.append([total, total])
-    P.line(.9, "frame envelope")
-    env = frame_env(x, total)
-    (PROJ / "src" / "timing.json").write_text(json.dumps({"fps": FPS, "total": total, "bounds": bounds, "holds": holds,
-                                                           "env": [round(float(v), 3) for v in env]}), encoding="utf-8")
-    P.done(f"{dur:.2f}s audio + {SCARE/FPS:.1f}s scare = {total} frames; cuts @ " + ", ".join(f"{b/FPS:.2f}s" for b in bounds[1:5]))
+const Scene = ({Sc,from,len,i}:any)=>{
+  const t=useCurrentFrame(), g=t+from, p=cl(t/len);
+  const e=(D.env as number[])[Math.min(g,D.env.length-1)]||0;
+  const f=.86+.08*Math.sin(g/3.1)+.04*Math.sin(g/7.7)+e*.12;
+  let bt=-999; for(const b of D.beats as number[]){ if(b<=g) bt=b; }
+  const z=1+.11*p+e*.004+.007*Math.exp(-(g-bt)/18);
+  const seed=Math.floor(g/6)%6+1;
+  return <AbsoluteFill style={{opacity:i===0?1:es(t/XF)}}>
+    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{transform:`scale(${z})`,transformOrigin:`${ORG[i][0]}px ${ORG[i][1]}px`}}>
+      <defs>
+        <linearGradient id="wall" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor={C.n0}/><stop offset="1" stopColor={C.n2}/></linearGradient>
+        <radialGradient id="gl"><stop offset="0" stopColor={C.y} stopOpacity=".9"/><stop offset="1" stopColor={C.y} stopOpacity="0"/></radialGradient>
+        <radialGradient id="gl2"><stop offset="0" stopColor={C.amb} stopOpacity=".9"/><stop offset="1" stopColor={C.amb} stopOpacity="0"/></radialGradient>
+        <radialGradient id="glb"><stop offset="0" stopColor="#3b5bc4" stopOpacity=".9"/><stop offset="1" stopColor="#3b5bc4" stopOpacity="0"/></radialGradient>
+        <radialGradient id="glr"><stop offset="0" stopColor="#a13a40" stopOpacity=".9"/><stop offset="1" stopColor="#a13a40" stopOpacity="0"/></radialGradient>
+        <filter id="bl"><feGaussianBlur stdDeviation="9"/></filter>
+        <filter id="boil" x="-2%" y="-2%" width="104%" height="104%"><feTurbulence type="fractalNoise" baseFrequency="0.011" numOctaves="2" seed={seed} result="n"/>
+          <feDisplacementMap in="SourceGraphic" in2="n" scale="9" xChannelSelector="R" yChannelSelector="G"/></filter>
+      </defs>
+      <g filter="url(#boil)"><Sc t={t} p={p} f={f} e={e}/></g>
+    </svg></AbsoluteFill>;
+};
 
-    P.start(4)
-    P.line(.3, "synth SFX + music + jumpscare")
-    mix = build_mix(x, total, pauses, bounds, holds)
-    write_wav(PROJ / "public" / "mix.wav", mix)
-    P.done(f"mix.wav {len(mix)/SR:.2f}s")
-    if PREP: print("--prep done."); return
+const Overlay = ()=>{
+  const g=useCurrentFrame(), fo=sg(g,D.total-150,D.total-30), fi=1-sg(g,0,24);
+  return <AbsoluteFill style={{pointerEvents:'none'}}><svg width={W} height={H}><defs>
+    <radialGradient id="vg" cx=".5" cy=".5" r=".75"><stop offset=".45" stopColor="#000" stopOpacity="0"/><stop offset="1" stopColor="#000" stopOpacity=".78"/></radialGradient>
+    <pattern id="gp" width="128" height="128" patternUnits="userSpaceOnUse" patternTransform={`translate(${(g*37)%128},${(g*61)%128})`}><image href={(D as any).grain} width="128" height="128"/></pattern></defs>
+    <rect width={W} height={H} fill="url(#vg)"/><rect width={W} height={H} fill="url(#gp)" opacity={.08}/>
+    <rect width={W} height={H} fill="#000" opacity={Math.max(fo,fi)}/></svg></AbsoluteFill>;
+};
 
-    # render in saved chunks: finished chunks survive Ctrl-C / crashes and are skipped on re-run
-    h = hashlib.md5((ART + MAIN + ROOT + INDEX + (PROJ / "src" / "timing.json").read_text(encoding="utf-8")).encode()).hexdigest()[:10]
-    cdir = DIR / "render_cache" / h
-    P.start(5)
-    nch0 = math.ceil(total / CHUNK); have = len(list(cdir.glob("part_????.mp4"))) if cdir.exists() else 0
-    print(f"\n   cache folder : {cdir}\n   saved chunks : {have}/{nch0} found" + ("  -> resuming" if have else "  (fresh render)"))
-    pr = subprocess.Popen([node, "render.js", str(cdir), str(CHUNK)], cwd=PROJ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                          text=True, encoding="utf-8", errors="replace", bufsize=1)
-    tail, t0, skipped, tot, nch = [], None, 0, total, math.ceil(total / CHUNK)
-    P.line(0, "bundling (first run downloads Chromium)")
+export const Main = ()=>{
+  const B = D.bounds as number[];
+  return <AbsoluteFill style={{background:'#000'}}>
+    <Audio src={staticFile('Elevenlabs.mp3')}/>
+    {SC.map((Sc,i)=><Sequence key={i} from={B[i]} durationInFrames={B[i+1]-B[i]+(i<SC.length-1?XF:0)}>
+      <Scene Sc={Sc} from={B[i]} len={B[i+1]-B[i]} i={i}/></Sequence>)}
+    <Overlay/>
+  </AbsoluteFill>;
+};
+'''
+wr("src/Video.tsx", VIDEO)
+print("   ✓ project written")
+
+# ----------------------------------------------------------------- 4. install
+step(4, "Installing dependencies (first run only)")
+if os.path.isdir(os.path.join(PROJ, "node_modules", "remotion")):
+    print("   ✓ already installed")
+else:
+    run_spin("npm install --no-audit --no-fund --loglevel=error", PROJ, "npm install")
+
+# ----------------------------------------------------------------- 5. render
+step(5, f"Rendering {TOTAL} frames @ {FPS}fps, {W}x{H} (audio muxed from the same timeline)")
+def free_gb():
     try:
-        for ln in pr.stdout:
-            ln = ln.strip(); tail = (tail + [ln])[-25:]; w = ln.split()
-            if not w: continue
-            if w[0] == "BUNDLE": P.line(.03 * float(w[1]) / 100, f"bundling {w[1]}%")
-            elif w[0] == "START": tot, nch = int(w[1]), int(w[2])
-            elif w[0] == "SKIP": skipped = int(w[1]); P.line(.03 + .92 * skipped / tot, f"resumed: {skipped}/{tot} fr cached")
-            elif w[0] in ("FRAME", "CHUNK"):
-                if w[0] == "CHUNK": print(f"\n   saved chunk {w[1]}/{w[2]}  ({w[3]}/{w[4]} frames safe on disk)")
-                cum = int(w[1]) if w[0] == "FRAME" else int(w[3]); t0 = t0 or time.time()
-                el = time.time() - t0; r = cum - skipped; fps_ = r / el if el > 1 else 0
-                eta = (tot - cum) / fps_ if fps_ else 0
-                P.line(.03 + .92 * cum / tot, f"{cum}/{tot} fr {fps_:.1f}fps ETA {eta:.0f}s")
-    except KeyboardInterrupt:
-        pr.kill(); sys.exit("\n\nStopped. Finished chunks are saved in render_cache - run again to resume.")
-    if pr.wait(): sys.exit("\nRender failed (finished chunks are kept):\n" + "\n".join(tail))
-    parts = sorted(cdir.glob("part_????.mp4"))
-    if len(parts) != nch: sys.exit(f"\nExpected {nch} chunks, found {len(parts)}")
-    P.line(.96, "joining chunks + audio")
-    lst = cdir / "list.txt"; lst.write_text("".join(f"file '{p.as_posix()}'\n" for p in parts), encoding="utf-8")
-    OUT.unlink(missing_ok=True)
-    mix_wav = PROJ / "public" / "mix.wav"
-    r = subprocess.run([str(c) for c in ffcmd() + ["-y", "-f", "concat", "-safe", "0", "-i", lst, "-i", mix_wav, "-map", "0:v:0", "-map", "1:a:0",
-                   "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", "-shortest", OUT]], cwd=PROJ, capture_output=True, text=True, errors="replace")
-    if r.returncode:      # fallback for stripped ffmpeg builds: concat filter + re-encode
-        ins = sum([["-i", p] for p in parts], [])
-        fc = "".join(f"[{i}:v]" for i in range(len(parts))) + f"concat=n={len(parts)}:v=1:a=0[v]"
-        run(ffcmd() + ["-y"] + ins + ["-i", mix_wav, "-filter_complex", fc, "-map", "[v]", "-map", f"{len(parts)}:a", "-c:v", "libx264", "-crf", "17",
-                       "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-shortest", OUT], cwd=PROJ)
-    P.done(f"saved {OUT.name} ({OUT.stat().st_size/1e6:.1f} MB)")
-    print(f"\nDONE -> {OUT}\nChunks kept in {cdir} (re-run resumes/re-joins instantly; --clean deletes cache)")
+        import ctypes
+        class MS(ctypes.Structure):
+            _fields_ = [("l", ctypes.c_ulong), ("ml", ctypes.c_ulong)] + [(n, ctypes.c_ulonglong) for n in ("tp", "ap", "tpf", "apf", "tv", "av", "ae")]
+        m = MS(); m.l = ctypes.sizeof(MS); ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)); return m.ap / 2**30
+    except Exception:
+        return 8.0
+conc = max(2, min((os.cpu_count() or 4) - 1, int(free_gb() / 0.9), 14))
+print(f"   using {conc} parallel Chrome tabs ({os.cpu_count()} cores, {free_gb():.1f} GB free RAM)")
+cmd = (f'npx remotion render src/index.ts Main "{OUT_MP4}" --codec=h264 --crf=18 '
+       f'--image-format=jpeg --jpeg-quality=95 --concurrency={conc} --overwrite --log=info')
+p = subprocess.Popen(cmd, cwd=PROJ, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                     env={**os.environ, "FORCE_COLOR": "0"})
+t0, stage, done, tail = time.time(), "Starting (bundling / launching Chrome)", 0, []
+while True:
+    ch = p.stdout.read1(4096)
+    if not ch and p.poll() is not None: break
+    txt = ch.decode("utf-8", "replace"); tail.append(txt); tail = tail[-30:]
+    low = txt.lower()
+    if "ncod" in low: stage = "Encoding"
+    elif "ender" in low: stage = "Rendering frames"
+    elif "tich" in low or "ombin" in low: stage = "Muxing audio + video"
+    for m in re.finditer(r"(\d+)\s*/\s*(\d+)", txt):
+        if int(m.group(2)) == TOTAL: done = max(done, int(m.group(1)))
+    el = time.time() - t0; fr = done / TOTAL
+    eta = el / fr - el if fr > 0.01 else 0
+    print(f"\r   {stage:<22} {bar(fr)} {fr*100:5.1f}%  {done}/{TOTAL} fr  "
+          f"elapsed {fmt(el)}  ETA {fmt(eta) if eta else '--:--'}   ", end="", flush=True)
+if p.returncode != 0:
+    print("\n" + "".join(tail)); sys.exit("Render failed")
+print(f"\r   ✓ Render complete {bar(1)} 100%  total {fmt(time.time()-t0)}                    ")
 
-
-if __name__ == "__main__":
-    main()
+# ----------------------------------------------------------------- 6. verify
+step(6, "Verifying sync")
+info = subprocess.run([FFMPEG, "-i", OUT_MP4], stderr=subprocess.PIPE, text=True).stderr
+m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", info)
+vd = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else 0
+print(f"   audio {dur:.2f}s | video file {vd:.2f}s | drift {abs(vd-dur)*1000:.0f} ms")
+print(f"\nDONE -> {OUT_MP4}  ({os.path.getsize(OUT_MP4)/1e6:.1f} MB)")
