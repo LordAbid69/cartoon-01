@@ -73,18 +73,16 @@ jobs:
 
       - name: Show timing
         if: always()
+        continue-on-error: true
         shell: bash
         run: |
-          python - <<'EOF'
-          import json, os
-          p = os.path.join(os.environ["CND_DIR"], "remotion_project", "src", "timing.json")
-          if os.path.exists(p):
-              t = json.load(open(p))
-              print("total frames:", t["total"], "| fps:", t["fps"], "| seconds:", round(t["total"] / t["fps"], 2), "| chunks expected:", -(-t["total"] // 120))
-          else:
-              print("timing.json not found")
-          EOF
-          find cnd/render_cache -name 'part_*.mp4' | sort
+          T="cnd/remotion_project/src/timing.json"
+          if [ -f "$T" ]; then
+            python3 -c "import json,math;t=json.load(open('$T'));print('total frames:',t['total'],'| seconds:',round(t['total']/t['fps'],2),'| chunks expected:',math.ceil(t['total']/120))"
+          else
+            echo "timing.json not found (script stopped before audio analysis)"
+          fi
+          find cnd/render_cache -name 'part_*.mp4' 2>/dev/null | sort || true
 
       - name: Save node_modules
         if: always() && matrix.shard == 0 && steps.nm.outputs.cache-hit != 'true' && hashFiles('cnd/remotion_project/node_modules/remotion/package.json') != ''
