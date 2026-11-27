@@ -12,6 +12,7 @@ PROJ = DIR / "remotion_project"
 OUT = DIR / "cartoon_60fps.mp4"
 FPS, SR = 60, 44100
 SCARE = 180        # jumpscare length in frames (3.0 s) appended after the narration
+SFX_LEVEL = .28    # sound effects vs voice (lower = quieter effects)
 CHUNK = 120        # frames per saved render chunk (2 s)
 PREP = "--prep" in sys.argv          # build + analyse + mix only (no npm/render)
 
@@ -576,12 +577,15 @@ def build_mix(x, total, pauses, bounds, holds):
     gate = np.ones(n)
     for ps, pe in pauses: gate[int(ps * SR):int(pe * SR)] = 0
     gate[An:] = 0; gate = lp(gate, int(.06 * SR))
-    mix = narr + make_music(n) * .16 * (1 - .55 * env) * gate
+    pkn = np.percentile(np.abs(narr[:An]), 99.8) + 1e-9
+    narr = narr * (.85 / pkn)                       # voice = loudest element
+    music = make_music(n) * .09 * (1 - .6 * env) * gate
+    sfx = np.zeros(n)                               # SFX bus: quiet, ducked while the voice speaks
     starts = [b / FPS for b in bounds[:5]]; acts = [h[0] / FPS for h in holds[:5]]
     def at(k, u): return starts[k] + u * (acts[k] - starts[k])
     def put(sig, t0, g=1.0):
         i = int(max(0, t0) * SR)
-        if i < n: s_ = sig[:n - i]; mix[i:i + len(s_)] += s_ * g
+        if i < n: s_ = sig[:n - i]; sfx[i:i + len(s_)] += s_ * g
     for k in range(5):
         put(s_zip(), at(k, 0), .35); put(s_bonk(), acts[k], .55)
     for u in (.25, .5, .75, .98): put(s_thump(), at(0, u), .9)
@@ -603,9 +607,13 @@ def build_mix(x, total, pauses, bounds, holds):
     put(s_poof(), at(4, .15), .6)
     for u in np.linspace(.30, .80, 9): put(s_cricket(), at(4, u), .22)
     put(s_zip(), at(4, .56), .3); put(s_trombone(), at(4, .60), .5); put(s_zip(), at(4, .93), .3)
+    mix = narr + music + sfx * SFX_LEVEL * (1 - .5 * env)
     pk = np.abs(mix[:An]).max()
     if pk > .97: mix *= .97 / pk
     mix[An:] = 0; fo = int(.03 * SR); mix[An - fo:An] *= np.linspace(1, 0, fo)
+    def put(sig, t0, g=1.0):                         # scare hits go straight to the mix at full level
+        i = int(max(0, t0) * SR)
+        if i < n: s_ = sig[:n - i]; mix[i:i + len(s_)] += s_ * g
     # ---- jumpscare (after narration): heartbeat + riser -> silence -> scream/boom/barks -> hard cut
     for d in (.2, .36, .7, .83, 1.0, 1.1): put(s_heart(), A + d, .9)
     put(s_riser(.87), A + .25, .35)
@@ -678,6 +686,8 @@ def main():
     h = hashlib.md5((ART + MAIN + ROOT + INDEX + (PROJ / "src" / "timing.json").read_text(encoding="utf-8")).encode()).hexdigest()[:10]
     cdir = DIR / "render_cache" / h
     P.start(5)
+    nch0 = math.ceil(total / CHUNK); have = len(list(cdir.glob("part_????.mp4"))) if cdir.exists() else 0
+    print(f"\n   cache folder : {cdir}\n   saved chunks : {have}/{nch0} found" + ("  -> resuming" if have else "  (fresh render)"))
     pr = subprocess.Popen([node, "render.js", str(cdir), str(CHUNK)], cwd=PROJ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                           text=True, encoding="utf-8", errors="replace", bufsize=1)
     tail, t0, skipped, tot, nch = [], None, 0, total, math.ceil(total / CHUNK)
@@ -690,6 +700,7 @@ def main():
             elif w[0] == "START": tot, nch = int(w[1]), int(w[2])
             elif w[0] == "SKIP": skipped = int(w[1]); P.line(.03 + .92 * skipped / tot, f"resumed: {skipped}/{tot} fr cached")
             elif w[0] in ("FRAME", "CHUNK"):
+                if w[0] == "CHUNK": print(f"\n   saved chunk {w[1]}/{w[2]}  ({w[3]}/{w[4]} frames safe on disk)")
                 cum = int(w[1]) if w[0] == "FRAME" else int(w[3]); t0 = t0 or time.time()
                 el = time.time() - t0; r = cum - skipped; fps_ = r / el if el > 1 else 0
                 eta = (tot - cum) / fps_ if fps_ else 0
