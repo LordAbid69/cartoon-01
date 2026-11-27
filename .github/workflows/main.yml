@@ -50,6 +50,17 @@ jobs:
       - name: Python dependencies
         run: pip install numpy
 
+      - name: Check script and audio
+        shell: bash
+        run: |
+          echo "--- first 8 lines of script ---"; head -n 8 "$SCRIPT"
+          if grep -q "Anaconda worker\|localhost:3188" "$SCRIPT"; then echo "ERROR: script contains Sublime popup text"; exit 1; fi
+          if ! grep -q "SHARDS" "$SCRIPT"; then echo "ERROR: shard edits (Edit 1 and 2) are missing from the script"; exit 1; fi
+          ls -l 20204.mp3
+          D="$(ffprobe -v error -show_entries format=duration -of csv=p=0 20204.mp3 || echo 0)"
+          echo "Audio duration: $D s"
+          awk -v d="$D" 'BEGIN{ if (d+0 < 5) { print "ERROR: audio shorter than 5 s or unreadable"; exit 1 } }'
+
       - name: Restore node_modules
         id: nm
         uses: actions/cache/restore@v4
@@ -60,8 +71,23 @@ jobs:
       - name: Render this shard
         run: python "$SCRIPT"
 
+      - name: Show timing
+        if: always()
+        shell: bash
+        run: |
+          python - <<'EOF'
+          import json, os
+          p = os.path.join(os.environ["CND_DIR"], "remotion_project", "src", "timing.json")
+          if os.path.exists(p):
+              t = json.load(open(p))
+              print("total frames:", t["total"], "| fps:", t["fps"], "| seconds:", round(t["total"] / t["fps"], 2), "| chunks expected:", -(-t["total"] // 120))
+          else:
+              print("timing.json not found")
+          EOF
+          find cnd/render_cache -name 'part_*.mp4' | sort
+
       - name: Save node_modules
-        if: always() && steps.nm.outputs.cache-hit != 'true' && hashFiles('cnd/remotion_project/node_modules/remotion/package.json') != ''
+        if: always() && matrix.shard == 0 && steps.nm.outputs.cache-hit != 'true' && hashFiles('cnd/remotion_project/node_modules/remotion/package.json') != ''
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
@@ -75,7 +101,7 @@ jobs:
           name: chunks-${{ matrix.shard }}
           path: cnd/render_cache
           if-no-files-found: ignore
-          retention-days: 3
+          retention-days: 7
           compression-level: 0
 
   join:
@@ -117,20 +143,52 @@ jobs:
           path: cnd/remotion_project/node_modules
           key: nm-v1
 
-      - name: Download all chunks
+      - name: Download chunks from shards 0 to 19
         uses: actions/download-artifact@v4
         with:
           pattern: chunks-*
           merge-multiple: true
           path: cnd/render_cache
 
-      - name: Join chunks with audio
+      - name: Verify chunks
+        shell: bash
+        run: |
+          N="$(find cnd/render_cache -name 'part_*.mp4' | wc -l)"
+          echo "Chunks found: $N"
+          find cnd/render_cache -name 'part_*.mp4' | sort
+          D="$(ffprobe -v error -show_entries format=duration -of csv=p=0 20204.mp3)"
+          E="$(python3 -c "import math; print(math.ceil((math.ceil($D*60)+180)/120))")"
+          echo "Audio: $D s | chunks expected: $E"
+          if [ "$N" -eq 0 ]; then echo "ERROR: no chunks downloaded"; exit 1; fi
+          if [ "$N" -lt "$E" ]; then echo "WARNING: $N of $E chunks found; the missing ones will be rendered in this job (slow)"; fi
+
+      - name: Join chunks with audio (in order)
         run: python "$SCRIPT"
 
-      - name: Upload final video
+      - name: Check final video
+        shell: bash
+        run: |
+          ls -l cnd/cartoon_60fps.mp4
+          V="$(ffprobe -v error -show_entries format=duration -of csv=p=0 cnd/cartoon_60fps.mp4)"
+          D="$(ffprobe -v error -show_entries format=duration -of csv=p=0 20204.mp3)"
+          echo "Video: $V s | audio: $D s | expected about $(python3 -c "print(round($D+3,1))") s"
+          awk -v v="$V" -v d="$D" 'BEGIN{ if (v+0 < d+2.5) { print "ERROR: video is shorter than audio + 3 s scare"; exit 1 } }'
+
+      - name: Upload final video (zip)
         uses: actions/upload-artifact@v4
         with:
           name: cartoon_60fps
           path: cnd/cartoon_60fps.mp4
           retention-days: 14
           compression-level: 0
+
+      - name: Upload debug info
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-info
+          path: |
+            cnd/remotion_project/src/timing.json
+            cnd/remotion_project/public/mix.wav
+          if-no-files-found: ignore
+          retention-days: 3
