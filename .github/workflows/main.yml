@@ -172,7 +172,7 @@ jobs:
             if(fs.existsSync(name)){done++;console.log('SKIP '+name);continue;}
             const tmp=name.replace(/\.mp4$/,'.tmp.mp4');
             let last=0;
-            await renderMedia({composition,serveUrl,codec:'h264',crf:18,pixelFormat:'yuv420p',imageFormat:'jpeg',jpegQuality:95,muted:true,frameRange:[a,b],outputLocation:tmp,concurrency:os.cpus().length,
+            await renderMedia({composition,serveUrl,codec:'h264',crf:23,pixelFormat:'yuv420p',imageFormat:'jpeg',jpegQuality:95,muted:true,frameRange:[a,b],outputLocation:tmp,concurrency:os.cpus().length,
              onProgress:({renderedFrames})=>{if(renderedFrames-last>=30){last=renderedFrames;console.log('chunk '+i+': '+renderedFrames+'/'+(b-a+1)+' frames');}}});
             fs.renameSync(tmp,name);done++;
             console.log('DONE chunk '+i+' ('+done+'/'+mine+')');
