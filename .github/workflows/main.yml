@@ -1,36 +1,30 @@
-name: Render cartoon
+name: Render video
 
 on:
   workflow_dispatch:
+    inputs:
+      script:
+        description: "Script file name (leave empty to auto-detect the file that uses Remotion)"
+        required: false
+        default: ""
+      max_shards:
+        description: "Max parallel render jobs (1-20)"
+        required: false
+        default: "20"
 
 permissions:
   contents: read
 
-env:
-  CND_DIR: ${{ github.workspace }}/cnd
-
 jobs:
-  render:
+  prep:
     runs-on: ubuntu-22.04
-    timeout-minutes: 355
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
+    timeout-minutes: 60
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
     env:
-      SHARD: ${{ matrix.shard }}
-      SHARDS: 20
+      CND_DIR: ${{ github.workspace }}/cnd
     steps:
       - uses: actions/checkout@v4
-
-      - name: Locate script
-        shell: bash
-        run: |
-          git ls-files
-          S="$(git ls-files | grep -v '^\.github/' | grep -i 'cartoon' | head -n1)"
-          if [ -z "$S" ]; then echo "No script with 'cartoon' in its name"; exit 1; fi
-          echo "Using script: $S"
-          echo "SCRIPT=$S" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
@@ -39,30 +33,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: Apply shard patch to script
-        shell: bash
-        run: |
-          python3 - <<'EOF'
-          import os, sys
-          p = os.environ["SCRIPT"]
-          s = open(p, encoding="utf-8").read()
-          if "process.env.SHARDS" in s:
-              print("Already patched"); sys.exit(0)
-          e1_old = " for(let i=0;i<n;i++){"
-          e1_new = e1_old + "\n  if((+process.env.SHARDS||1)>1&&i%(+process.env.SHARDS)!==+process.env.SHARD)continue;"
-          e2_old = r'''    if pr.wait(): sys.exit("\nRender failed (finished chunks are kept):\n" + "\n".join(tail))'''
-          e2_new = e2_old + '\n    if os.environ.get("SHARD"):\n        P.done("shard finished"); return'
-          e3_old = "codec:'h264',crf:17,"
-          e3_new = "codec:'h264',crf:17,concurrency:require('os').cpus().length,"
-          for name, old, new in (("Edit 1", e1_old, e1_new), ("Edit 2", e2_old, e2_new), ("Edit 3", e3_old, e3_new)):
-              if s.count(old) != 1:
-                  print("ERROR:", name, "target text found", s.count(old), "times (expected 1). The script file differs from the original.")
-                  sys.exit(1)
-              s = s.replace(old, new)
-          open(p, "w", encoding="utf-8").write(s)
-          print("Patched OK")
-          EOF
 
       - name: System dependencies
         run: |
@@ -74,104 +44,263 @@ jobs:
       - name: Python dependencies
         run: pip install numpy
 
-      - name: Check script and audio
+      - name: Locate script and audio
+        shell: bash
+        env:
+          SCRIPT_IN: ${{ inputs.script }}
+        run: |
+          set +e
+          echo "Repo root files:"; git ls-files | grep -v /
+          S="$SCRIPT_IN"
+          if [ -z "$S" ]; then
+            S="$(git ls-files | grep -v / | grep -v -i -E '\.(md|yml|yaml|mp3|wav|m4a|aac|ogg|flac|txt)$' | while IFS= read -r f; do grep -Iq -i remotion "$f" && echo "$f"; done | sed -n '1p')"
+          fi
+          if [ -z "$S" ] || [ ! -f "$S" ]; then
+            echo "::error::No script found. Upload your .py file to the repo root (or type its exact name when running the workflow)."
+            exit 1
+          fi
+          echo "Using script: $S"
+          echo "SCRIPT=$S" >> "$GITHUB_ENV"
+          mkdir -p cnd
+          git ls-files | grep -v / | grep -i -E '\.(mp3|wav|m4a|aac|ogg|flac)$' | while IFS= read -r f; do
+            cp "$f" cnd/
+            echo "Audio: $f | $(ls -l "$f" | awk '{print $5}') bytes | $(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f") s"
+          done
+          exit 0
+
+      - name: Run script (creates the Remotion project, render skipped)
         shell: bash
         run: |
-          echo "--- first 8 lines of script ---"; head -n 8 "$SCRIPT"
-          if grep -q "Anaconda worker\|localhost:3188" "$SCRIPT"; then echo "ERROR: script contains Sublime popup text"; exit 1; fi
-          if ! grep -q "SHARDS" "$SCRIPT"; then echo "ERROR: shard edits are missing from the script"; exit 1; fi
-          ls -l 20204.mp3
-          D="$(ffprobe -v error -show_entries format=duration -of csv=p=0 20204.mp3 || echo 0)"
-          echo "Audio duration: $D s"
-          awk -v d="$D" 'BEGIN{ if (d+0 < 5) { print "ERROR: audio shorter than 5 s or unreadable"; exit 1 } }'
+          set +e
+          python3 - <<'EOF'
+          import os, re
+          s = open(os.environ["SCRIPT"], encoding="utf-8", errors="replace").read()
+          target = os.environ["CND_DIR"]
+          pat = re.compile(r"""[rRuUbB]*(["'])[A-Za-z]:\\[^"'\r\n]*\1""")
+          out, n = pat.subn(lambda m: "r" + m.group(1) + target + m.group(1), s)
+          open("patched_script.py", "w", encoding="utf-8").write(out)
+          print("Windows paths replaced:", n)
+          EOF
+          mkdir -p shim
+          cat > shim/npx <<'EOF'
+          #!/bin/bash
+          if [ "$1" = "remotion" ] && [ "$2" = "render" ]; then
+            echo "[shim] render skipped (entry=$3 composition=$4)"
+            if [ -n "$5" ]; then mkdir -p "$(dirname "$5")"; : > "$5"; fi
+            exit 0
+          fi
+          exec "$REAL_NPX" "$@"
+          EOF
+          chmod +x shim/npx
+          export REAL_NPX="$(command -v npx)"
+          FLAGS=""
+          if grep -q -- '"--prep"' "$SCRIPT"; then FLAGS="--prep"; fi
+          echo "Running: python3 patched_script.py $FLAGS"
+          PATH="$PWD/shim:$PATH" python3 -u patched_script.py $FLAGS 2>&1 | tee prep.log | tail -n 60
+          exit 0
+
+      - name: Collect generated project
+        shell: bash
+        run: |
+          R="$(find . -type f -path '*/src/Root.*' -not -path '*/node_modules/*' -not -path './.git/*' | sed -n '1p')"
+          if [ -z "$R" ]; then
+            echo "::error::The script did not generate a Remotion project (no src/Root.* found). Last log lines:"
+            tail -n 40 prep.log
+            exit 1
+          fi
+          P="$(dirname "$(dirname "$R")")"
+          echo "Project dir: $P"
+          mv "$P" project
+
+      - name: Install dependencies, write helpers, plan chunks
+        id: plan
+        shell: bash
+        working-directory: project
+        env:
+          MAX_SHARDS: ${{ inputs.max_shards }}
+        run: |
+          set -e
+          if ! grep -q '"remotion"' package.json; then
+            npm install --save --no-audit --no-fund --loglevel=error remotion@^4 @remotion/bundler@^4 @remotion/renderer@^4 @remotion/cli@^4 react@18 react-dom@18
+          else
+            npm install --no-audit --no-fund --loglevel=error
+          fi
+          VER="$(node -p "require('./node_modules/remotion/package.json').version")"
+          echo "Remotion version: $VER"
+          npm install --save --no-audit --no-fund --loglevel=error "@remotion/bundler@$VER" "@remotion/renderer@$VER"
+
+          cat > plan.js <<'EOF'
+          const fs=require('fs'),path=require('path');
+          const {bundle}=require('@remotion/bundler');
+          const R=require('@remotion/renderer');
+          (async()=>{
+           const entry=['src/index.ts','src/index.tsx','src/index.js','src/index.jsx'].find(f=>fs.existsSync(f));
+           if(!entry)throw new Error('No src/index.(ts|tsx|js|jsx) in the generated project');
+           try{await R.ensureBrowser();}catch(e){console.log('ensureBrowser:',e.message);}
+           const opts={entryPoint:path.resolve(entry)};
+           if(fs.existsSync('public'))opts.publicDir=path.resolve('public');
+           const serveUrl=await bundle(opts);
+           const comps=await R.getCompositions(serveUrl);
+           if(!comps.length)throw new Error('No compositions found');
+           const c=comps.find(x=>x.id===process.env.COMP_ID)||comps[0];
+           const chunk=Math.max(1,Math.round(c.fps*2));
+           const plan={entry,id:c.id,fps:c.fps,width:c.width,height:c.height,total:c.durationInFrames,chunk,n:Math.ceil(c.durationInFrames/chunk)};
+           fs.writeFileSync('plan.json',JSON.stringify(plan));
+           console.log('PLAN '+JSON.stringify(plan));
+          })().catch(e=>{console.error(e);process.exit(1);});
+          EOF
+
+          cat > shard.js <<'EOF'
+          const fs=require('fs'),path=require('path'),os=require('os');
+          const {bundle}=require('@remotion/bundler');
+          const {selectComposition,renderMedia}=require('@remotion/renderer');
+          (async()=>{
+           const plan=JSON.parse(fs.readFileSync('plan.json','utf8'));
+           const SHARD=+(process.env.SHARD||0),SHARDS=+(process.env.SHARDS||1);
+           fs.mkdirSync('chunks',{recursive:true});
+           const opts={entryPoint:path.resolve(plan.entry)};
+           if(fs.existsSync('public'))opts.publicDir=path.resolve('public');
+           const serveUrl=await bundle(opts);
+           const composition=await selectComposition({serveUrl,id:plan.id});
+           let mine=0,done=0;
+           for(let i=0;i<plan.n;i++)if(i%SHARDS===SHARD)mine++;
+           console.log('Shard '+SHARD+' of '+SHARDS+' renders '+mine+' chunks');
+           for(let i=0;i<plan.n;i++){
+            if(i%SHARDS!==SHARD)continue;
+            const a=i*plan.chunk,b=Math.min(plan.total-1,a+plan.chunk-1);
+            const name=path.join('chunks','part_'+String(i).padStart(4,'0')+'.mp4');
+            if(fs.existsSync(name)){done++;console.log('SKIP '+name);continue;}
+            const tmp=name.replace(/\.mp4$/,'.tmp.mp4');
+            let last=0;
+            await renderMedia({composition,serveUrl,codec:'h264',crf:18,pixelFormat:'yuv420p',imageFormat:'jpeg',jpegQuality:95,muted:true,frameRange:[a,b],outputLocation:tmp,concurrency:os.cpus().length,
+             onProgress:({renderedFrames})=>{if(renderedFrames-last>=30){last=renderedFrames;console.log('chunk '+i+': '+renderedFrames+'/'+(b-a+1)+' frames');}}});
+            fs.renameSync(tmp,name);done++;
+            console.log('DONE chunk '+i+' ('+done+'/'+mine+')');
+           }
+           console.log('SHARD COMPLETE');
+          })().catch(e=>{console.error(e);process.exit(1);});
+          EOF
+
+          cat > audio.js <<'EOF'
+          const fs=require('fs'),path=require('path');
+          const {bundle}=require('@remotion/bundler');
+          const {selectComposition,renderMedia}=require('@remotion/renderer');
+          (async()=>{
+           const plan=JSON.parse(fs.readFileSync('plan.json','utf8'));
+           const opts={entryPoint:path.resolve(plan.entry)};
+           if(fs.existsSync('public'))opts.publicDir=path.resolve('public');
+           const serveUrl=await bundle(opts);
+           const composition=await selectComposition({serveUrl,id:plan.id});
+           await renderMedia({composition,serveUrl,codec:'wav',outputLocation:'audio.wav'});
+           console.log('AUDIO DONE');
+          })().catch(e=>{console.error(e);process.exit(1);});
+          EOF
+
+          node plan.js
+          node -e "const p=require('./plan.json');const s=p.total/p.fps;console.log('Composition '+p.id+': '+p.width+'x'+p.height+' @ '+p.fps+' fps, '+p.total+' frames = '+s.toFixed(2)+' s, '+p.n+' chunks');if(s<6){console.log('::error::Composition is only '+s.toFixed(2)+' s. The audio was probably not read. Check the audio file and the script.');process.exit(1);}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+          N="$(node -p "require('./plan.json').n")"
+          MAXS="${MAX_SHARDS:-20}"
+          case "$MAXS" in ''|*[!0-9]*) MAXS=20;; esac
+          if [ "$MAXS" -lt 1 ]; then MAXS=1; fi
+          if [ "$MAXS" -gt 20 ]; then MAXS=20; fi
+          S=$(( N < MAXS ? N : MAXS ))
+          LIST="$(python3 -c "import json;print(json.dumps(list(range($S))))")"
+          echo "Parallel jobs: $S"
+          echo "shards=$LIST" >> "$GITHUB_OUTPUT"
+
+      - name: Save node_modules cache
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: project/node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('project/package.json') }}
+
+      - name: Stage project (without node_modules)
+        run: |
+          mkdir proj_art
+          rsync -a --exclude node_modules --exclude chunks project/ proj_art/
+          ls -la proj_art
+
+      - name: Upload project
+        uses: actions/upload-artifact@v4
+        with:
+          name: project
+          path: proj_art
+          retention-days: 3
+          overwrite: true
+
+  render:
+    needs: prep
+    runs-on: ubuntu-22.04
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.prep.outputs.shards) }}
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnss3 libdbus-1-3 libatk1.0-0 libgbm-dev \
+            libasound2 libxrandr2 libxkbcommon-dev libxfixes3 libxcomposite1 \
+            libxdamage1 libatk-bridge2.0-0 libpango-1.0-0 libcairo2 libcups2
+
+      - name: Download project
+        uses: actions/download-artifact@v4
+        with:
+          name: project
+          path: project
 
       - name: Restore node_modules
         id: nm
         uses: actions/cache/restore@v4
         with:
-          path: cnd/remotion_project/node_modules
-          key: nm-v1
+          path: project/node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('project/package.json') }}
+
+      - name: Install dependencies (cache miss)
+        if: steps.nm.outputs.cache-hit != 'true'
+        working-directory: project
+        run: npm install --no-audit --no-fund --loglevel=error
+
+      - name: Restore chunks from an earlier attempt
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: chunks-${{ matrix.shard }}
+          path: project/chunks
 
       - name: Render this shard
-        run: python "$SCRIPT"
-
-      - name: Show timing
-        if: always()
-        continue-on-error: true
-        shell: bash
-        run: |
-          T="cnd/remotion_project/src/timing.json"
-          if [ -f "$T" ]; then
-            python3 -c "import json,math;t=json.load(open('$T'));print('total frames:',t['total'],'| seconds:',round(t['total']/t['fps'],2),'| chunks expected:',math.ceil(t['total']/120))"
-          else
-            echo "timing.json not found (script stopped before audio analysis)"
-          fi
-          find cnd/render_cache -name 'part_*.mp4' 2>/dev/null | sort || true
-
-      - name: Save node_modules
-        if: always() && matrix.shard == 0 && steps.nm.outputs.cache-hit != 'true' && hashFiles('cnd/remotion_project/node_modules/remotion/package.json') != ''
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: cnd/remotion_project/node_modules
-          key: nm-v1
+        working-directory: project
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ strategy.job-total }}
+        run: node shard.js
 
       - name: Upload chunks
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: chunks-${{ matrix.shard }}
-          path: cnd/render_cache
+          path: project/chunks
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 3
           compression-level: 0
+          overwrite: true
 
   join:
-    needs: render
+    needs: [prep, render]
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Locate script
-        shell: bash
-        run: |
-          S="$(git ls-files | grep -v '^\.github/' | grep -i 'cartoon' | head -n1)"
-          if [ -z "$S" ]; then echo "No script with 'cartoon' in its name"; exit 1; fi
-          echo "Using script: $S"
-          echo "SCRIPT=$S" >> "$GITHUB_ENV"
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-
-      - name: Apply shard patch to script
-        shell: bash
-        run: |
-          python3 - <<'EOF'
-          import os, sys
-          p = os.environ["SCRIPT"]
-          s = open(p, encoding="utf-8").read()
-          if "process.env.SHARDS" in s:
-              print("Already patched"); sys.exit(0)
-          e1_old = " for(let i=0;i<n;i++){"
-          e1_new = e1_old + "\n  if((+process.env.SHARDS||1)>1&&i%(+process.env.SHARDS)!==+process.env.SHARD)continue;"
-          e2_old = r'''    if pr.wait(): sys.exit("\nRender failed (finished chunks are kept):\n" + "\n".join(tail))'''
-          e2_new = e2_old + '\n    if os.environ.get("SHARD"):\n        P.done("shard finished"); return'
-          e3_old = "codec:'h264',crf:17,"
-          e3_new = "codec:'h264',crf:17,concurrency:require('os').cpus().length,"
-          for name, old, new in (("Edit 1", e1_old, e1_new), ("Edit 2", e2_old, e2_new), ("Edit 3", e3_old, e3_new)):
-              if s.count(old) != 1:
-                  print("ERROR:", name, "target text found", s.count(old), "times (expected 1). The script file differs from the original.")
-                  sys.exit(1)
-              s = s.replace(old, new)
-          open(p, "w", encoding="utf-8").write(s)
-          print("Patched OK")
-          EOF
 
       - name: System dependencies
         run: |
@@ -180,61 +309,69 @@ jobs:
             libasound2 libxrandr2 libxkbcommon-dev libxfixes3 libxcomposite1 \
             libxdamage1 libatk-bridge2.0-0 libpango-1.0-0 libcairo2 libcups2
 
-      - name: Python dependencies
-        run: pip install numpy
+      - name: Download project
+        uses: actions/download-artifact@v4
+        with:
+          name: project
+          path: project
 
       - name: Restore node_modules
+        id: nm
         uses: actions/cache/restore@v4
         with:
-          path: cnd/remotion_project/node_modules
-          key: nm-v1
+          path: project/node_modules
+          key: nm-${{ runner.os }}-${{ hashFiles('project/package.json') }}
 
-      - name: Download chunks from shards 0 to 19
+      - name: Install dependencies (cache miss)
+        if: steps.nm.outputs.cache-hit != 'true'
+        working-directory: project
+        run: npm install --no-audit --no-fund --loglevel=error
+
+      - name: Download all chunks
         uses: actions/download-artifact@v4
         with:
           pattern: chunks-*
           merge-multiple: true
-          path: cnd/render_cache
+          path: project/chunks
 
       - name: Verify chunks
-        shell: bash
+        working-directory: project
         run: |
-          N="$(find cnd/render_cache -name 'part_*.mp4' | wc -l)"
-          echo "Chunks found: $N"
-          find cnd/render_cache -name 'part_*.mp4' | sort
-          D="$(ffprobe -v error -show_entries format=duration -of csv=p=0 20204.mp3)"
-          E="$(python3 -c "import math; print(math.ceil((math.ceil($D*60)+180)/120))")"
-          echo "Audio: $D s | chunks expected: $E"
-          if [ "$N" -eq 0 ]; then echo "ERROR: no chunks downloaded"; exit 1; fi
-          if [ "$N" -lt "$E" ]; then echo "WARNING: $N of $E chunks found; the missing ones will be rendered in this job (slow)"; fi
+          N="$(node -p "require('./plan.json').n")"
+          F="$(ls chunks/part_*.mp4 2>/dev/null | wc -l)"
+          echo "Chunks: $F of $N"
+          if [ "$F" -ne "$N" ]; then
+            echo "::error::Missing chunks ($F of $N). Use 'Re-run failed jobs' on this run."
+            exit 1
+          fi
 
-      - name: Join chunks with audio (in order)
-        run: python "$SCRIPT"
+      - name: Render audio track
+        working-directory: project
+        run: node audio.js
+
+      - name: Join chunks with audio
+        working-directory: project
+        run: |
+          for f in $(ls chunks/part_*.mp4 | sort); do echo "file '$PWD/$f'"; done > list.txt
+          FPS="$(node -p "require('./plan.json').fps")"
+          ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -i audio.wav \
+            -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -movflags +faststart -shortest "video_${FPS}fps.mp4"
+          ls -l video_*.mp4
 
       - name: Check final video
-        shell: bash
+        working-directory: project
         run: |
-          ls -l cnd/cartoon_60fps.mp4
-          V="$(ffprobe -v error -show_entries format=duration -of csv=p=0 cnd/cartoon_60fps.mp4)"
-          D="$(ffprobe -v error -show_entries format=duration -of csv=p=0 20204.mp3)"
-          echo "Video: $V s | audio: $D s | expected about $(python3 -c "print(round($D+3,1))") s"
-          awk -v v="$V" -v d="$D" 'BEGIN{ if (v+0 < d+2.5) { print "ERROR: video is shorter than audio + 3 s scare"; exit 1 } }'
+          F="$(ls video_*fps.mp4 | sed -n '1p')"
+          V="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$F")"
+          E="$(node -p "(require('./plan.json').total/require('./plan.json').fps).toFixed(2)")"
+          echo "Video: $V s | expected: $E s" | tee -a "$GITHUB_STEP_SUMMARY"
+          awk -v v="$V" -v e="$E" 'BEGIN{d=v-e; if(d<0)d=-d; if(d>0.5){print "ERROR: video length differs from the composition"; exit 1}}'
 
       - name: Upload final video (zip)
         uses: actions/upload-artifact@v4
         with:
-          name: cartoon_60fps
-          path: cnd/cartoon_60fps.mp4
+          name: final-video
+          path: project/video_*fps.mp4
           retention-days: 14
           compression-level: 0
-
-      - name: Upload debug info
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-info
-          path: |
-            cnd/remotion_project/src/timing.json
-            cnd/remotion_project/public/mix.wav
-          if-no-files-found: ignore
-          retention-days: 3
+          overwrite: true
