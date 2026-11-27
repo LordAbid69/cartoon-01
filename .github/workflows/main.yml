@@ -26,10 +26,9 @@ jobs:
       - name: Locate script
         shell: bash
         run: |
-          echo "Repo files:"; git ls-files
-          S="$(git ls-files '*.py' | grep -i cartoon | head -n1)"
-          if [ -z "$S" ]; then S="$(git ls-files '*.py' | head -n1)"; fi
-          if [ -z "$S" ]; then echo "No .py file found in repo"; exit 1; fi
+          git ls-files
+          S="$(git ls-files | grep -v '^\.github/' | grep -i 'cartoon' | head -n1)"
+          if [ -z "$S" ]; then echo "No script with 'cartoon' in its name"; exit 1; fi
           echo "Using script: $S"
           echo "SCRIPT=$S" >> "$GITHUB_ENV"
 
@@ -89,9 +88,8 @@ jobs:
       - name: Locate script
         shell: bash
         run: |
-          S="$(git ls-files '*.py' | grep -i cartoon | head -n1)"
-          if [ -z "$S" ]; then S="$(git ls-files '*.py' | head -n1)"; fi
-          if [ -z "$S" ]; then echo "No .py file found in repo"; exit 1; fi
+          S="$(git ls-files | grep -v '^\.github/' | grep -i 'cartoon' | head -n1)"
+          if [ -z "$S" ]; then echo "No script with 'cartoon' in its name"; exit 1; fi
           echo "Using script: $S"
           echo "SCRIPT=$S" >> "$GITHUB_ENV"
 
