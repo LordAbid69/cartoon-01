@@ -40,6 +40,30 @@ jobs:
         with:
           node-version: "20"
 
+      - name: Apply shard patch to script
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          import os, sys
+          p = os.environ["SCRIPT"]
+          s = open(p, encoding="utf-8").read()
+          if "process.env.SHARDS" in s:
+              print("Already patched"); sys.exit(0)
+          e1_old = " for(let i=0;i<n;i++){"
+          e1_new = e1_old + "\n  if((+process.env.SHARDS||1)>1&&i%(+process.env.SHARDS)!==+process.env.SHARD)continue;"
+          e2_old = r'''    if pr.wait(): sys.exit("\nRender failed (finished chunks are kept):\n" + "\n".join(tail))'''
+          e2_new = e2_old + '\n    if os.environ.get("SHARD"):\n        P.done("shard finished"); return'
+          e3_old = "codec:'h264',crf:17,"
+          e3_new = "codec:'h264',crf:17,concurrency:require('os').cpus().length,"
+          for name, old, new in (("Edit 1", e1_old, e1_new), ("Edit 2", e2_old, e2_new), ("Edit 3", e3_old, e3_new)):
+              if s.count(old) != 1:
+                  print("ERROR:", name, "target text found", s.count(old), "times (expected 1). The script file differs from the original.")
+                  sys.exit(1)
+              s = s.replace(old, new)
+          open(p, "w", encoding="utf-8").write(s)
+          print("Patched OK")
+          EOF
+
       - name: System dependencies
         run: |
           sudo apt-get update
@@ -55,7 +79,7 @@ jobs:
         run: |
           echo "--- first 8 lines of script ---"; head -n 8 "$SCRIPT"
           if grep -q "Anaconda worker\|localhost:3188" "$SCRIPT"; then echo "ERROR: script contains Sublime popup text"; exit 1; fi
-          if ! grep -q "SHARDS" "$SCRIPT"; then echo "ERROR: shard edits (Edit 1 and 2) are missing from the script"; exit 1; fi
+          if ! grep -q "SHARDS" "$SCRIPT"; then echo "ERROR: shard edits are missing from the script"; exit 1; fi
           ls -l 20204.mp3
           D="$(ffprobe -v error -show_entries format=duration -of csv=p=0 20204.mp3 || echo 0)"
           echo "Audio duration: $D s"
@@ -124,6 +148,30 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
+
+      - name: Apply shard patch to script
+        shell: bash
+        run: |
+          python3 - <<'EOF'
+          import os, sys
+          p = os.environ["SCRIPT"]
+          s = open(p, encoding="utf-8").read()
+          if "process.env.SHARDS" in s:
+              print("Already patched"); sys.exit(0)
+          e1_old = " for(let i=0;i<n;i++){"
+          e1_new = e1_old + "\n  if((+process.env.SHARDS||1)>1&&i%(+process.env.SHARDS)!==+process.env.SHARD)continue;"
+          e2_old = r'''    if pr.wait(): sys.exit("\nRender failed (finished chunks are kept):\n" + "\n".join(tail))'''
+          e2_new = e2_old + '\n    if os.environ.get("SHARD"):\n        P.done("shard finished"); return'
+          e3_old = "codec:'h264',crf:17,"
+          e3_new = "codec:'h264',crf:17,concurrency:require('os').cpus().length,"
+          for name, old, new in (("Edit 1", e1_old, e1_new), ("Edit 2", e2_old, e2_new), ("Edit 3", e3_old, e3_new)):
+              if s.count(old) != 1:
+                  print("ERROR:", name, "target text found", s.count(old), "times (expected 1). The script file differs from the original.")
+                  sys.exit(1)
+              s = s.replace(old, new)
+          open(p, "w", encoding="utf-8").write(s)
+          print("Patched OK")
+          EOF
 
       - name: System dependencies
         run: |
