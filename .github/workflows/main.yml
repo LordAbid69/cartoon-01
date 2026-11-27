@@ -23,6 +23,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Locate script
+        shell: bash
+        run: |
+          echo "Repo files:"; git ls-files
+          S="$(git ls-files '*.py' | grep -i cartoon | head -n1)"
+          if [ -z "$S" ]; then S="$(git ls-files '*.py' | head -n1)"; fi
+          if [ -z "$S" ]; then echo "No .py file found in repo"; exit 1; fi
+          echo "Using script: $S"
+          echo "SCRIPT=$S" >> "$GITHUB_ENV"
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -49,7 +59,7 @@ jobs:
           key: nm-v1
 
       - name: Render this shard
-        run: python "python cartoon.py"
+        run: python "$SCRIPT"
 
       - name: Save node_modules
         if: always() && steps.nm.outputs.cache-hit != 'true' && hashFiles('cnd/remotion_project/node_modules/remotion/package.json') != ''
@@ -75,6 +85,15 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      - name: Locate script
+        shell: bash
+        run: |
+          S="$(git ls-files '*.py' | grep -i cartoon | head -n1)"
+          if [ -z "$S" ]; then S="$(git ls-files '*.py' | head -n1)"; fi
+          if [ -z "$S" ]; then echo "No .py file found in repo"; exit 1; fi
+          echo "Using script: $S"
+          echo "SCRIPT=$S" >> "$GITHUB_ENV"
 
       - uses: actions/setup-python@v5
         with:
@@ -108,7 +127,7 @@ jobs:
           path: cnd/render_cache
 
       - name: Join chunks with audio
-        run: python "python cartoon.py"
+        run: python "$SCRIPT"
 
       - name: Upload final video
         uses: actions/upload-artifact@v4
