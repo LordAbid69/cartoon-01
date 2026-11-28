@@ -101,6 +101,8 @@ jobs:
           print("Windows paths replaced:", n)
           EOF
           mkdir -p shim
+
+          # ---- npx shim: skip remotion render
           cat > shim/npx <<'EOF'
           #!/bin/bash
           HAS_R=0; HAS_REM=0; OUTF=""
@@ -116,6 +118,8 @@ jobs:
           fi
           exec "$REAL_NPX" "$@"
           EOF
+
+          # ---- node shim: skip render scripts
           cat > shim/node <<'EOF'
           #!/bin/bash
           case "$1" in
@@ -127,11 +131,38 @@ jobs:
           esac
           exec "$REAL_NODE" "$@"
           EOF
-          chmod +x shim/npx shim/node
+
+          # ---- ffmpeg shim: auto-repair sidechaincompress format failures
+          cat > shim/ffmpeg <<'EOF'
+          #!/usr/bin/env python3
+          import os, re, subprocess, sys
+          real = os.environ["REAL_FFMPEG"]
+          args = sys.argv[1:]
+          r = subprocess.run([real] + args)
+          if r.returncode == 0 or not any("sidechaincompress" in a for a in args):
+              sys.exit(r.returncode)
+          F = "sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo"
+          pat = re.compile(r"\[(\w+)\]\[(\w+)\]sidechaincompress=([^\[;]*)\[(\w+)\]")
+          def fixA(a):
+              return pat.sub(lambda m: "[%s]aformat=%s[%sx];[%s]aformat=%s[%sx];[%sx][%sx]sidechaincompress=%s[%s]" % (
+                  m.group(1), F, m.group(1), m.group(2), F, m.group(2), m.group(1), m.group(2), m.group(3), m.group(4)), a)
+          def fixB(a):
+              return pat.sub(lambda m: "[%s]anullsink;[%s]anull[%s]" % (m.group(2), m.group(1), m.group(4)), a)
+          for name, fn in (("aformat", fixA), ("no-ducking", fixB)):
+              sys.stderr.write("[ffmpeg shim] retry with %s fix\n" % name)
+              r = subprocess.run([real] + [fn(a) for a in args])
+              if r.returncode == 0:
+                  sys.exit(0)
+          sys.exit(r.returncode)
+          EOF
+
+          chmod +x shim/npx shim/node shim/ffmpeg
           export REAL_NPX="$(command -v npx)"
           export REAL_NODE="$(command -v node)"
+          export REAL_FFMPEG="$(command -v ffmpeg)"
           FLAGS=""
-          if grep -q -- '"--prep"' "$SCRIPT"; then FLAGS="--prep"; fi
+          if grep -q -- '"--prep-only"' "$SCRIPT"; then FLAGS="--prep-only"
+          elif grep -q -- '"--prep"' "$SCRIPT"; then FLAGS="--prep"; fi
           echo "Running: python3 patched_script.py $FLAGS"
           PATH="$PWD/shim:$PATH" python3 -u patched_script.py $FLAGS 2>&1 | tee prep.log | tail -n 60
           exit 0
