@@ -58,7 +58,12 @@ jobs:
         run: |
           set +e
           echo "Repo root files:"; git ls-files | grep -v /
-          S="$SCRIPT_IN"
+          S=""
+          # accept "cartoon.py", "python cartoon.py", "python3 ./cartoon.py --x" ...
+          for tok in $SCRIPT_IN; do
+            tok="${tok#./}"
+            if [ -f "$tok" ]; then S="$tok"; break; fi
+          done
           if [ -z "$S" ]; then
             S="$(git ls-files | grep -v / | grep -i -E '\.(py|js|mjs|cjs|ts)$' | while IFS= read -r f; do grep -Iq -i remotion "$f" && echo "$f"; done | sed -n '1p')"
           fi
@@ -193,6 +198,20 @@ jobs:
           echo "Project dir: $P"
           mkdir -p project
           rsync -a --exclude node_modules --exclude .git --exclude project --exclude chunks "$P"/ project/
+
+          # external audio: the script's own final mix wins, else the first audio file in cnd/
+          EXT=""
+          MIX="$(find . -type f \( -name 'final_mix.wav' -o -name 'final_mix.mp3' -o -name 'mix.wav' \) -not -path '*/node_modules/*' -not -path './project/*' -not -path './.git/*' | sed -n '1p')"
+          if [ -n "$MIX" ]; then EXT="$MIX"; fi
+          if [ -z "$EXT" ]; then
+            EXT="$(ls cnd/*.mp3 cnd/*.wav cnd/*.m4a cnd/*.aac cnd/*.ogg cnd/*.flac 2>/dev/null | sed -n '1p')"
+          fi
+          if [ -n "$EXT" ]; then
+            cp "$EXT" "project/ext_audio.${EXT##*.}"
+            echo "External audio: $EXT"
+          else
+            echo "No external audio found; will render audio from the Remotion composition."
+          fi
           ls -la project
 
       - name: Install dependencies, write helpers, plan chunks
@@ -225,7 +244,8 @@ jobs:
           echo "Entry: $ENTRY"
           echo "$ENTRY" > entry.txt
 
-          cat > plan.js <<'EOF'
+          # helpers are .cjs so they work even when package.json has "type": "module"
+          cat > plan.cjs <<'EOF'
           const fs=require('fs'),path=require('path');
           const {bundle}=require('@remotion/bundler');
           const R=require('@remotion/renderer');
@@ -246,7 +266,7 @@ jobs:
           })().catch(e=>{console.error(e);process.exit(1);});
           EOF
 
-          cat > shard.js <<'EOF'
+          cat > shard.cjs <<'EOF'
           const fs=require('fs'),path=require('path'),os=require('os');
           const {bundle}=require('@remotion/bundler');
           const {selectComposition,renderMedia}=require('@remotion/renderer');
@@ -268,7 +288,7 @@ jobs:
             if(fs.existsSync(name)){done++;console.log('SKIP '+name);continue;}
             const tmp=name.replace(/\.mp4$/,'.tmp.mp4');
             let last=0;
-            await renderMedia({composition,serveUrl,codec:'h264',crf:21,pixelFormat:'yuv420p',imageFormat:'jpeg',jpegQuality:95,muted:true,frameRange:[a,b],outputLocation:tmp,concurrency:os.cpus().length,
+            await renderMedia({composition,serveUrl,codec:'h264',crf:21,pixelFormat:'yuv420p',imageFormat:'jpeg',jpegQuality:95,muted:true,frameRange:[a,b],outputLocation:tmp,concurrency:os.cpus().length,timeoutInMilliseconds:240000,
              onProgress:({renderedFrames})=>{if(renderedFrames-last>=30){last=renderedFrames;console.log('chunk '+i+': '+renderedFrames+'/'+(b-a+1)+' frames');}}});
             fs.renameSync(tmp,name);done++;
             console.log('DONE chunk '+i+' ('+done+'/'+mine+')');
@@ -277,7 +297,7 @@ jobs:
           })().catch(e=>{console.error(e);process.exit(1);});
           EOF
 
-          cat > audio.js <<'EOF'
+          cat > audio.cjs <<'EOF'
           const fs=require('fs'),path=require('path');
           const {bundle}=require('@remotion/bundler');
           const {selectComposition,renderMedia}=require('@remotion/renderer');
@@ -292,7 +312,7 @@ jobs:
           })().catch(e=>{console.error(e);process.exit(1);});
           EOF
 
-          node plan.js
+          node plan.cjs
           node -e "const p=require('./plan.json');const s=p.total/p.fps;console.log('Composition '+p.id+': '+p.width+'x'+p.height+' @ '+p.fps+' fps, '+p.total+' frames = '+s.toFixed(2)+' s, '+p.n+' chunks');if(s<3){console.log('::error::Composition is only '+s.toFixed(2)+' s. Audio/inputs were probably not read.');process.exit(1);}" | tee -a "$GITHUB_STEP_SUMMARY"
 
           N="$(node -p "require('./plan.json').n")"
@@ -376,7 +396,7 @@ jobs:
         env:
           SHARD: ${{ matrix.shard }}
           SHARDS: ${{ strategy.job-total }}
-        run: node shard.js
+        run: node shard.cjs
 
       - name: Upload chunks
         if: always()
@@ -441,17 +461,28 @@ jobs:
             exit 1
           fi
 
-      - name: Render audio track
+      - name: Prepare audio track
         working-directory: project
-        run: node audio.js
+        run: |
+          EXT="$(ls ext_audio.* 2>/dev/null | sed -n '1p')"
+          if [ -n "$EXT" ]; then
+            echo "Using external audio: $EXT"
+            echo "$EXT" > audio_src.txt
+          else
+            echo "Rendering audio from the Remotion composition"
+            node audio.cjs
+            echo "audio.wav" > audio_src.txt
+          fi
 
       - name: Join chunks with audio
         working-directory: project
         run: |
           for f in $(ls chunks/part_*.mp4 | sort); do echo "file '$PWD/$f'"; done > list.txt
           FPS="$(node -p "require('./plan.json').fps")"
-          ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -i audio.wav \
-            -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -movflags +faststart -shortest "video_${FPS}fps.mp4"
+          DUR="$(node -p "(require('./plan.json').total/require('./plan.json').fps).toFixed(4)")"
+          A="$(cat audio_src.txt)"
+          ffmpeg -y -loglevel error -f concat -safe 0 -i list.txt -i "$A" \
+            -map 0:v:0 -map 1:a:0 -c:v copy -af apad -c:a aac -b:a 320k -t "$DUR" -movflags +faststart "video_${FPS}fps.mp4"
           ls -l video_*.mp4
 
       - name: Check final video
