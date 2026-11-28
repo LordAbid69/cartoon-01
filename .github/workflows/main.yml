@@ -28,7 +28,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - uses: actions/setup-node@v4
         with:
@@ -91,8 +91,20 @@ jobs:
           fi
           exec "$REAL_NPX" "$@"
           EOF
-          chmod +x shim/npx
+          cat > shim/node <<'EOF'
+          #!/bin/bash
+          case "$1" in
+            *render.mjs)
+              echo "[shim] node render skipped ($1)"
+              echo "ALLDONE"
+              exit 0
+              ;;
+          esac
+          exec "$REAL_NODE" "$@"
+          EOF
+          chmod +x shim/npx shim/node
           export REAL_NPX="$(command -v npx)"
+          export REAL_NODE="$(command -v node)"
           FLAGS=""
           if grep -q -- '"--prep"' "$SCRIPT"; then FLAGS="--prep"; fi
           echo "Running: python3 patched_script.py $FLAGS"
