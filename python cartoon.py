@@ -1,1136 +1,1096 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Amar Poribar - audio-driven 2D hand-drawn horror animation (Remotion).
-1080x1920 | 60 fps | resumable chunked render | audio-locked timeline.
+make_video.py  -  one-file pipeline: Elevenlabs.mp3  ->  1080x1920 @ 60fps 2D horror animation (Remotion)
 
-    pip install rich
-    (Node.js >= 18 required)  ->  python make_amar_poribar.py
-    Options: --fresh (wipe render cache)   --stills (one preview PNG per scene, no video)
+What it does (all automatic, resumable):
+  1. checks tools (node, npm, ffmpeg)         5. renders preview stills (fail-fast check)
+  2. analyses the voice (per-frame loudness,  6. renders the video in 10-second chunks, each saved to disk
+     pauses) and locks scene cuts to pauses      -> re-run the script and it continues where it stopped
+  3. synthesises the sound-design bed         7. joins chunks + mixes audio (voice always louder, SFX ducked
+  4. writes the Remotion project, npm install    under the voice) -> final_video.mp4
+
+Run:   python make_video.py            (put Elevenlabs.mp3 in the output folder first)
+Flags: --prep-only   only steps 1-4 (analysis, sfx, project)     --fresh  throw away saved chunks
+       --no-preview  skip stills                                   --crf N  quality (default 17, lower = better)
 """
-import os, sys, json, math, time, shutil, hashlib, argparse, subprocess
-from array import array
+import os, sys, json, math, subprocess, shutil, time, re, hashlib, wave, zlib, struct, argparse
 from pathlib import Path
 
-try:
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.table import Table
-    from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
-                               TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn)
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "rich"])
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.table import Table
-    from rich.progress import (Progress, SpinnerColumn, TextColumn, BarColumn,
-                               TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn)
+OUT_DIR = Path(os.environ.get("CND_DIR", r"C:\Users\laptop villa\Documents\cnd"))
+AUDIO   = OUT_DIR / "Elevenlabs.mp3"
+WORK    = OUT_DIR / "work"
+PROJ    = WORK / "remotion"
+CHUNKS  = WORK / "chunks"
+STILLS  = OUT_DIR / "previews"
+FINAL   = OUT_DIR / "final_video.mp4"
+FPS, CHUNK_FRAMES = 60, 600
+SR = 44100
 
 try:
-    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 
-# ----------------------------------------------------------------------------- CONFIG
-OUT_DIR = Path(r"C:\Users\laptop villa\Documents\cnd")
-AUDIO_NAME = "Elevenlabs.mp3"
-FINAL_NAME = "Amar_Poribar_1080x1920_60fps.mp4"
-FPS, WIDTH, HEIGHT = 60, 1080, 1920
-TAIL_SEC = 1.5          # eerie silence after the last word
-HALF = 20               # half of the scene cross-dissolve, in frames
-CHUNK_FRAMES = 600      # resume granularity (10 s)
-CRF, JPEG_Q = 14, 97    # visual quality
-TITLE_SPOKEN = True     # set False if the narration does not read the title
-SR = 22050              # analysis sample rate
-MIN_SIL = 0.20          # seconds of quiet that count as a pause
-MIN_BEAT = 0.6          # minimum seconds per sentence
+# ----------------------------------------------------------------------------- small UI helpers
+T0 = time.time()
+def hms(s):
+    s = int(max(0, s)); return f"{s//3600:d}:{(s%3600)//60:02d}:{s%60:02d}" if s >= 3600 else f"{s//60:02d}:{s%60:02d}"
+def stage(n, total, title):
+    print(f"\n[{n}/{total}] {title}   (elapsed {hms(time.time()-T0)})", flush=True)
+def bar(frac, w=34):
+    frac = min(1.0, max(0.0, frac)); k = int(frac * w); return "[" + "#" * k + "-" * (w - k) + f"] {frac*100:5.1f}%"
+def line(txt):
+    sys.stdout.write("\r" + txt.ljust(118)[:118]); sys.stdout.flush()
+def run(cmd, **kw):
+    return subprocess.run(cmd, check=True, **kw)
+def die(msg):
+    print("\nERROR: " + msg); sys.exit(1)
 
+def ensure_numpy():
+    try:
+        import numpy  # noqa
+    except ImportError:
+        print("numpy missing -> installing (one time)...")
+        subprocess.run([sys.executable, "-m", "pip", "install", "numpy"], check=True)
+ensure_numpy()
+import numpy as np
+
+# ----------------------------------------------------------------------------- scenes (story beats)
+# name, narration characters (used to place the cut inside the nearest real pause), tension 0..1
 SCENES = [
-    ("intro", ["আমার পরিবার", "আমি আট বছর আগে মারা গেছি।"]),
-    ("road", ["ঘটনাটা তেমন মর্মান্তিক বা অস্বাভাবিক কিছু ছিল না।", "স্রেফ একটা সড়ক দুর্ঘটনা।",
-              "যে লোকটা আমাকে ধাক্কা দিয়েছিল, তাকে আমি দোষ দিই না।",
-              "তার স্ত্রীর প্রসবব্যথা উঠেছিল, তাই সে তাড়াহুড়ো করে গাড়ি চালাচ্ছিল।",
-              "হঠাৎ গাড়ির নিয়ন্ত্রণ হারিয়ে ফেলে।", "আর সেই দুর্ঘটনাতেই আমার মৃত্যু হয়।"]),
-    ("calm", ["এটা তার দোষ ছিল না।", "আমি জানি।", "আমি নিষ্ঠুর নই, প্রতিশোধ নেওয়ার ইচ্ছাও আমার নেই।"]),
-    ("funeral", ["আসলে আমার কোনো পরিবার ছিল না।", "মৃত্যুর কিছুদিন আগেই হাতে গোনা কয়েকজন বন্ধুকেও হারিয়েছিলাম।",
-                 "আমার জানাজায় শেষ পর্যন্ত মাত্র কয়েকজন মানুষ এসেছিল—আমার অফিসের বস আর সেই পরিবারটা, যাদের গাড়ির ধাক্কায় আমার মৃত্যু হয়েছিল।",
-                 "মহিলাটির কোলে তখন তার সদ্যোজাত মেয়েটি।"]),
-    ("follow", ["আমি আমার বসকে একদম সহ্য করতে পারতাম না।", "আর কবরস্থানে একা একা পড়ে থাকতেও ভালো লাগছিল না।",
-                "তাই পরিবারটার পিছু নিয়ে তাদের বাসা পর্যন্ত চলে গেলাম।"]),
-    ("nursery", ["ছোট্ট মায়াকে দেখে মনে হতো, সে যেন আমার নিজেরই মেয়ে।", "কী মিষ্টি আর হাসিখুশি ছিল!",
-                 "রাতে কেউ দোলনা না দোলালে তার ঘুমই আসত না।", "ওর বাবা-মাও সারাদিনের পরিশ্রমে একেবারে ক্লান্ত থাকতেন।",
-                 "তাই তারা ওকে ঘুম পাড়িয়ে চলে যাওয়ার পর আমি চুপচাপ দোলনাটা দুলিয়ে দিতাম।",
-                 "আমার তো আর ক্লান্তি লাগত না।", "অন্তত ওর কাজে তো আসতে পারছিলাম।"]),
-    ("aware", ["বছর গড়াতে লাগল।", "একসময় রায়হান আর নীলা বুঝতে পারল, তাদের বাসায় তারা ছাড়াও আরও কেউ আছে।",
-               "আমার মৃত্যুর দিন আর আমার উপস্থিতির সময় মিলিয়ে তারা ব্যাপারটা বুঝে গেল।",
-               "তবে আমি কখনো তাদের কোনো ক্ষতি করিনি।", "তাই তারা ভয়ও পেত না, রাগও করত না।"]),
-    ("anniv", ["প্রতি বছর আমার মৃত্যুবার্ষিকীতে তারা মোমবাতি জ্বালাত।", "খাবারের টেবিলে আমার জন্য একটা চেয়ার খালি রাখত।",
-               "ঈদ কিংবা অন্য কোনো উৎসবেও আমাকে ভুলত না।", "সত্যি বলতে, নিজেকে তাদের পরিবারেরই একজন মনে হতো।"]),
-    ("door", ["কিন্তু এখন কেউ একজন দরজা ভাঙার চেষ্টা করছে।", "নীলার সাবেক স্বামী।", "লোকটা ভীষণ জেদি আর রাগী।",
-              "সে আমার পরিবারটার ক্ষতি করতে এসেছে।", "আমার পরিবার।"]),
-    ("power", ["ভূতদের একটা ব্যাপার আছে।", "যত বেশি উপহার আর স্মরণ পাবে, ততই তাদের শক্তি বাড়বে।",
-               "গত পাঁচ বছর ধরে ওদের দেওয়া মোমবাতি, ছোটখাটো উপহার, এমনকি মাঝেমধ্যে খাবারও পেয়েছি।",
-               "এসবের কারণে আমি এখন আগের চেয়ে অনেক শক্তিশালী।", "আমার হাতে ছুরিটা উষ্ণ লাগছে।",
-               "বরফের মতো ঠান্ডা হাতের মধ্যে এক অদ্ভুত উত্তাপ।"]),
-    ("finale", ["নীলা, রায়হান আর মায়া—ওরাই আমার পরিবার।", "আমি ওদের ভালোবাসি।",
-                "আর ওদের এখনই আমার সঙ্গে ওপারে যেতে দেব না।"]),
+    ("title", 17, .15), ("alert_a", 86, .25), ("alert_b", 147, .35), ("disbelief", 96, .40),
+    ("bathroom", 78, .50), ("texting", 96, .50), ("friend", 149, .60), ("clock", 29, .55),
+    ("alert2", 127, .80), ("door2", 199, .85), ("sirens", 90, .90), ("outside", 107, .95),
+    ("noreply", 77, .90), ("shaking", 102, 1.0), ("knock1", 79, .90), ("knock2", 138, 1.0),
 ]
 
-console = Console()
-TOTAL_STEPS = 7
+# sentence lengths (characters) of the story, line by line, and how many sentences each scene covers
+SENT_LINES = [[17], [34, 52, 47, 23, 36, 15, 26], [56, 40, 50, 28], [48, 20, 28, 28, 50, 24, 12, 35], [12], [17],
+              [14, 35, 29, 49, 72, 21, 15, 28, 41, 22], [38, 8, 15, 29], [33, 11, 26, 12, 11, 40, 14], [29, 27, 21, 34, 32, 36], [59, 20, 15, 36, 26, 18, 43]]
+SCENE_SENTS = [1, 2, 5, 2, 2, 3, 5, 2, 4, 6, 4, 7, 3, 3, 2, 5]
 
-
-def step(i, name):
-    console.rule(f"[bold cyan]Step {i}/{TOTAL_STEPS}  {name}")
-
-
-def die(msg):
-    console.print(f"[bold red]ERROR:[/] {msg}")
-    sys.exit(1)
-
-
-# ----------------------------------------------------------------------------- JS SOURCES
-PACKAGE_JSON = {
-    "name": "amar-poribar", "version": "1.0.0", "private": True,
-    "dependencies": {
-        "react": "18.3.1", "react-dom": "18.3.1",
-        "remotion": "^4.0.0", "@remotion/cli": "^4.0.0",
-        "@remotion/bundler": "^4.0.0", "@remotion/renderer": "^4.0.0",
-    },
-}
-
-JS_INDEX = r'''import React from 'react';
-import {registerRoot, Composition} from 'remotion';
-import {Main} from './Main';
-import data from './data.json';
-
-const Root = () => (
-  <Composition id="Story" component={Main} durationInFrames={data.totalFrames} fps={data.fps} width={1080} height={1920} />
-);
-registerRoot(Root);
-'''
-
-JS_RENDER = r''''use strict';
-const path = require('path');
-const fs = require('fs');
-const {bundle} = require('@remotion/bundler');
-const R = require('@remotion/renderer');
-const emit = (o) => process.stdout.write('@@' + JSON.stringify(o) + '\n');
-
-(async () => {
-  const job = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-  emit({t: 'stage', m: 'bundle'});
-  const serveUrl = await bundle({
-    entryPoint: path.join(job.root, 'src', 'index.jsx'),
-    onProgress: (p) => emit({t: 'bundle', p}),
-  });
-  if (typeof R.ensureBrowser === 'function') {
-    emit({t: 'stage', m: 'browser'});
-    await R.ensureBrowser();
-  }
-  const comp = await R.selectComposition({serveUrl, id: 'Story', inputProps: {}});
-
-  if (job.mode === 'stills') {
-    emit({t: 'stage', m: 'render'});
-    for (const [i, fr] of job.stills.entries()) {
-      const out = path.join(job.stillsDir, 'scene_' + String(i).padStart(2, '0') + '.png');
-      await R.renderStill({composition: comp, serveUrl, output: out, frame: fr, imageFormat: 'png'});
-      emit({t: 'still', i, n: job.stills.length, out});
-    }
-    emit({t: 'end'});
-    return;
-  }
-
-  emit({t: 'stage', m: 'render'});
-  for (const [i, rg] of job.ranges.entries()) {
-    const s = rg[0], e = rg[1], n = e - s + 1;
-    const fin = path.join(job.cache, 'chunk_' + String(i).padStart(4, '0') + '.mp4');
-    if (fs.existsSync(fin)) { emit({t: 'skip', i, n}); continue; }
-    const tmp = fin.replace(/\.mp4$/, '.part.mp4');
-    emit({t: 'start', i, n});
-    let last = 0;
-    await R.renderMedia({
-      composition: comp, serveUrl, codec: 'h264', outputLocation: tmp,
-      frameRange: [s, e], muted: true, crf: job.crf, pixelFormat: 'yuv420p', x264Preset: 'medium',
-      imageFormat: 'jpeg', jpegQuality: job.jpegQuality, concurrency: job.concurrency,
-      overwrite: true, logLevel: 'error',
-      onProgress: (p) => {
-        const now = Date.now();
-        if (now - last > 150) { last = now; emit({t: 'prog', i, rf: p.renderedFrames, ef: p.encodedFrames}); }
-      },
-    });
-    fs.renameSync(tmp, fin);
-    emit({t: 'done', i, n});
-  }
-  emit({t: 'end'});
-})().catch((e) => { emit({t: 'error', m: String((e && e.stack) || e)}); process.exit(1); });
-'''
-
-JS_MAIN = r'''import React from 'react';
-import {AbsoluteFill, Audio, Sequence, staticFile, useCurrentFrame} from 'remotion';
-import data from './data.json';
-
-/* ============================== core helpers ============================== */
-const W = 1080, H = 1920, INK = '#090705';
-const C = {n0: '#060a16', n1: '#0c1530', n2: '#16224a', b0: '#1d130c', b1: '#33231a', b2: '#4d3626', b3: '#6b4b34', y: '#f2e2a0', y2: '#d9c274'};
-const Boil = React.createContext(0);
-const h = (n) => { const x = Math.sin(n * 12.9898 + 78.233) * 43758.5453; return x - Math.floor(x); };
-const cl = (v, a = 0, b = 1) => Math.max(a, Math.min(b, v));
-const P = (f, a, b) => cl((f - a) / Math.max(1, b - a));
-const E = (x) => x * x * (3 - 2 * x);
-const lerp = (a, b, t) => a + (b - a) * t;
-const mod = (a, n) => ((a % n) + n) % n;
-const Seq = (f, beats, vals, tr = 28) => {
-  let v = vals[0];
-  for (let i = 1; i < vals.length; i++) { const t0 = beats[Math.min(i, beats.length - 1)]; v = lerp(v, vals[i], E(P(f, t0, t0 + tr))); }
-  return v;
-};
-const Pick = (f, beats, vals) => vals[Math.min(vals.length - 1, Math.max(0, beats.filter((x) => f >= x).length - 1))];
-const ell = (cx, cy, rx, ry, n = 12, rot = 0) => Array.from({length: n}, (_, i) => { const a = i / n * Math.PI * 2 + rot; return [cx + Math.cos(a) * rx, cy + Math.sin(a) * ry]; });
-
-const smooth = (p, closed) => {
-  const n = p.length;
-  if (n < 3) return `M${p[0][0]} ${p[0][1]}L${p[n - 1][0]} ${p[n - 1][1]}`;
-  const g = (i) => (closed ? p[(i + n) % n] : p[Math.max(0, Math.min(n - 1, i))]);
-  let d = `M${p[0][0].toFixed(1)} ${p[0][1].toFixed(1)}`;
-  const m = closed ? n : n - 1;
-  for (let i = 0; i < m; i++) {
-    const p0 = g(i - 1), p1 = g(i), p2 = g(i + 1), p3 = g(i + 2);
-    const c1 = [p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6];
-    const c2 = [p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6];
-    d += `C${c1[0].toFixed(1)} ${c1[1].toFixed(1)} ${c2[0].toFixed(1)} ${c2[1].toFixed(1)} ${p2[0].toFixed(1)} ${p2[1].toFixed(1)}`;
-  }
-  return d + (closed ? 'Z' : '');
-};
-const jit = (pts, seed, bf, j) => pts.map((q, i) => [q[0] + (h(seed * 17.3 + i * 3.1 + bf * 7.7) - .5) * 2 * j, q[1] + (h(seed * 29.1 + i * 5.3 + bf * 3.9 + 9.1) - .5) * 2 * j]);
-
-/* hand-drawn primitives: line "boil" re-seeds every 5 frames (12 fps drawing feel) */
-const Shape = ({pts, fill = 'none', stroke = INK, sw = 5, seed = 1, j = 2.2, closed = true, op = 1}) => {
-  const bf = React.useContext(Boil);
-  return <path d={smooth(jit(pts, seed, bf, j), closed)} fill={fill} stroke={stroke} strokeWidth={sw} strokeLinecap="round" strokeLinejoin="round" opacity={op} />;
-};
-const Poly = ({pts, fill = 'none', stroke = INK, sw = 5, seed = 1, j = 1.8, op = 1}) => {
-  const bf = React.useContext(Boil);
-  const out = [];
-  pts.forEach((a, i) => { const b = pts[(i + 1) % pts.length]; out.push(a); out.push([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]); });
-  const p = jit(out, seed, bf, j);
-  return <path d={'M' + p.map((q) => q[0].toFixed(1) + ' ' + q[1].toFixed(1)).join('L') + 'Z'} fill={fill} stroke={stroke} strokeWidth={sw} strokeLinejoin="round" opacity={op} />;
-};
-
-const Defs = () => (
-  <defs>
-    <linearGradient id="gWall" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#070c20" /><stop offset="1" stopColor="#16224a" /></linearGradient>
-    <linearGradient id="gFloor" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#2e1f15" /><stop offset="1" stopColor="#100a06" /></linearGradient>
-    <linearGradient id="gWin" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#7f98c8" /><stop offset="1" stopColor="#25355f" /></linearGradient>
-    <linearGradient id="gSky" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#03060e" /><stop offset="1" stopColor="#1a2650" /></linearGradient>
-    <linearGradient id="gSky2" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#070c24" /><stop offset=".75" stopColor="#1b2448" /><stop offset="1" stopColor="#4a3a3a" /></linearGradient>
-    <linearGradient id="gOpen" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stopColor="#2c3250" /><stop offset="1" stopColor="#ecdca0" /></linearGradient>
-    <linearGradient id="gMist" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stopColor="#9fb4d6" stopOpacity="0" /><stop offset=".5" stopColor="#9fb4d6" stopOpacity=".22" /><stop offset="1" stopColor="#9fb4d6" stopOpacity="0" /></linearGradient>
-    <radialGradient id="gLamp"><stop offset="0" stopColor="#ffe8a0" stopOpacity=".9" /><stop offset=".4" stopColor="#f0c870" stopOpacity=".33" /><stop offset="1" stopColor="#e8b050" stopOpacity="0" /></radialGradient>
-    <radialGradient id="gMoon"><stop offset="0" stopColor="#9db8f0" stopOpacity=".5" /><stop offset="1" stopColor="#6f90d8" stopOpacity="0" /></radialGradient>
-    <radialGradient id="gGhost"><stop offset="0" stopColor="#bcd4ff" stopOpacity=".55" /><stop offset="1" stopColor="#8aaaf0" stopOpacity="0" /></radialGradient>
-    <radialGradient id="gEye"><stop offset="0" stopColor="#fff3b0" stopOpacity=".95" /><stop offset="1" stopColor="#ffd870" stopOpacity="0" /></radialGradient>
-  </defs>
-);
-const Glow = ({x, y, r, g = 'gLamp', op = 1}) => <circle cx={x} cy={y} r={r} fill={`url(#${g})`} opacity={op} style={{mixBlendMode: 'screen'}} />;
-
-/* camera: look-at point + zoom, clamped so the frame never leaves the canvas */
-const Stage = ({f, d, z0 = 1, z1 = 1.12, z, cx = 540, cy = 960, children}) => {
-  const zz = Math.max(1.03, z ?? lerp(z0, z1, f / Math.max(1, d)));
-  const fx = cl(cx, 540 / zz, W - 540 / zz), fy = cl(cy, 960 / zz, H - 960 / zz);
-  const sx = Math.sin(f / 53) * 3, sy = Math.cos(f / 61) * 2.5;
-  return (
-    <AbsoluteFill>
-      <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} style={{position: 'absolute', left: 0, top: 0}}>
-        <Defs />
-        <g transform={`translate(${540 + sx} ${960 + sy}) scale(${zz}) translate(${-fx} ${-fy})`}>{children}</g>
-      </svg>
-    </AbsoluteFill>
-  );
-};
-
-/* ================================ characters ================================ */
-const KINDS = {
-  man: {skin: '#a8917d', top: '#34406a', bot: '#231d17', hair: '#17120e'},
-  boss: {skin: '#a58f7c', top: '#2c2b2e', bot: '#1a1a1d', hair: '#6e6c6a'},
-  woman: {skin: '#b39b87', top: '#6a4636', bot: '#6a4636', hair: '#120d0a'},
-  child: {skin: '#b9a28d', top: '#c4b277', bot: '#c4b277', hair: '#17120e'},
-  ex: {skin: '#7f6c5c', top: '#14171f', bot: '#0f1118', hair: '#0b0a09'},
-  ghost: {skin: '#cfdced', top: '#a9bcd9', bot: '#a9bcd9', hair: '#7f93b4'},
-};
-
-const Person = ({x = 0, y = 0, s = 1, kind = 'man', flip = 1, e = {}, mouth = 0, glow = 0, aura = .55, shadow = false, t = 0, seed = 1, arms = {}, op = 1, tilt = 0, float = 0, shade = 0, extra = null}) => {
-  const K = KINDS[kind], G = kind === 'ghost', bf = React.useContext(Boil);
-  const F = (c) => (shadow ? '#03050b' : c);
-  const bob = G ? Math.sin(t / 30 + seed) * 14 : Math.sin(t / 57 + seed) * 3;
-  const sway = Math.sin(t / 41 + seed * 2) * 6;
-  const hy = -440 + bob * .4;
-  const eyeS = e.eye ?? 1, br = e.brow ?? 0, lk = e.look || [0, 0], mo = e.mo || 'flat';
-  const blink = ((t + seed * 53) % 190) < 6 ? .1 : 1;
-  const jj = (v, i) => v + (h(seed * 7 + i * 1.7 + bf * 3.1) - .5) * 3;
-  const hL = arms.l || [-122, -172 + sway], hR = arms.r || [122, -172 - sway];
-  const limb = (a, b, w, col, bend = 0) => {
-    const m = [(a[0] + b[0]) / 2 + bend, (a[1] + b[1]) / 2 + Math.abs(bend) * .3];
-    const dd = `M${jj(a[0], 1)} ${jj(a[1], 2)}Q${m[0]} ${m[1]} ${jj(b[0], 3)} ${jj(b[1], 4)}`;
-    return (<g>
-      {!shadow && <path d={dd} fill="none" stroke={INK} strokeWidth={w + 9} strokeLinecap="round" />}
-      <path d={dd} fill="none" stroke={F(col)} strokeWidth={w} strokeLinecap="round" />
-    </g>);
-  };
-  const w = Math.sin(t / 14) * 14;
-  const torso = G ? [[-100, -340], [100, -340], [104, -220], [78, -120 + w], [40, -50 - w], [6, 10 + w], [-30, -48 - w], [-70, -122 + w], [-104, -220]]
-    : kind === 'woman' ? [[-88, -340], [88, -340], [100, -230], [142, -66], [-142, -66], [-100, -230]]
-    : [[-98, -340], [98, -340], [90, -230], [84, -170], [-84, -170], [-90, -230]];
-  const hairFront = kind === 'woman'
-    ? [[-94, hy - 30], [-62, hy - 106], [0, hy - 120], [62, hy - 106], [94, hy - 30], [52, hy - 70], [0, hy - 60], [-52, hy - 70]]
-    : [[-93, hy - 20], [-84, hy - 84], [-40, hy - 112], [22, hy - 116], [72, hy - 90], [93, hy - 26], [70, hy - 62], [10, hy - 80], [-50, hy - 72]];
-  const hairBack = [[-112, hy - 40], [-100, hy - 112], [0, hy - 132], [100, hy - 112], [114, hy - 40], [128, hy + 170], [70, hy + 210], [-70, hy + 210], [-128, hy + 170]];
-  const y0 = hy + 58;
-  const talking = mouth > .12;
-  return (
-    <g transform={`translate(${x} ${y - float}) scale(${s * flip} ${s}) rotate(${tilt})`} opacity={op}>
-      {G && !shadow && <Glow x={0} y={-250} r={430} g="gGhost" op={aura} />}
-      {kind === 'woman' && <Shape pts={hairBack} fill={F(K.hair)} stroke={shadow ? 'none' : INK} seed={seed + 40} />}
-      {!G && kind !== 'woman' && <g>{limb([-38, -180], [-42, -14], 46, K.bot)}{limb([38, -180], [42, -14], 46, K.bot)}
-        {!shadow && <g><Shape pts={ell(-48, -8, 36, 14, 8)} fill="#0e0b09" stroke="none" seed={seed + 1} /><Shape pts={ell(48, -8, 36, 14, 8)} fill="#0e0b09" stroke="none" seed={seed + 2} /></g>}</g>}
-      {kind === 'woman' && <g>{limb([-46, -70], [-46, -12], 26, K.skin)}{limb([46, -70], [46, -12], 26, K.skin)}</g>}
-      <Shape pts={torso} fill={F(K.top)} stroke={shadow ? 'none' : INK} sw={5} seed={seed + 3} j={2.4} />
-      {limb([-92, -322], hL, 38, K.top, -14)}
-      {limb([92, -322], hR, 38, K.top, 14)}
-      {!shadow && <g><circle cx={hL[0]} cy={hL[1]} r="21" fill={K.skin} stroke={INK} strokeWidth="4" /><circle cx={hR[0]} cy={hR[1]} r="21" fill={K.skin} stroke={INK} strokeWidth="4" /></g>}
-      {kind === 'child' && <g><Shape pts={ell(-114, hy + 30, 28, 42, 8)} fill={F(K.hair)} stroke={shadow ? 'none' : INK} seed={seed + 5} /><Shape pts={ell(114, hy + 30, 28, 42, 8)} fill={F(K.hair)} stroke={shadow ? 'none' : INK} seed={seed + 6} /></g>}
-      <circle cx="-90" cy={hy + 8} r="18" fill={F(K.skin)} stroke={shadow ? 'none' : INK} strokeWidth="4" />
-      <circle cx="90" cy={hy + 8} r="18" fill={F(K.skin)} stroke={shadow ? 'none' : INK} strokeWidth="4" />
-      <Shape pts={ell(0, hy, 90, 99, 12)} fill={F(K.skin)} stroke={shadow ? 'none' : INK} sw={5} seed={seed + 7} j={2.4} />
-      <Shape pts={hairFront} fill={F(K.hair)} stroke={shadow ? 'none' : INK} sw={4} seed={seed + 8} j={2} />
-      {!shadow && <g>
-        {[-1, 1].map((sd) => {
-          const ex = sd * 37, ey = hy - 8;
-          return (<g key={sd}>
-            {G ? (<g>
-              <Shape pts={ell(ex, ey, 27, 37 * eyeS, 9)} fill="#04060c" sw={3} seed={seed + sd + 3} j={1.5} />
-              <circle cx={ex + lk[0] * 9} cy={ey + lk[1] * 10} r={7 + glow * 7} fill={glow > .25 ? '#fff0a8' : '#c3d2ea'} />
-              {glow > 0 && <Glow x={ex} y={ey} r={50 + glow * 70} g="gEye" op={glow} />}
-            </g>) : (<g>
-              <Shape pts={ell(ex, ey, 25, 29 * eyeS * blink, 9)} fill="#e8e0cc" sw={3.5} seed={seed + sd + 3} j={1.2} />
-              <circle cx={ex + lk[0] * 9} cy={ey + lk[1] * 8} r={11 * Math.min(1, blink * 1.6)} fill="#14100d" />
-            </g>)}
-            <Shape pts={[[sd * 12, hy - 54 - 16 * br], [sd * 39, hy - 58 - 3 * br], [sd * 66, hy - 54 + 9 * br]]} closed={false} stroke={G ? '#2a3550' : '#171310'} sw={9} j={1.2} seed={seed + sd + 9} />
-            <Shape pts={[[ex - 22, ey + 36], [ex, ey + 43], [ex + 22, ey + 36]]} closed={false} stroke="rgba(20,14,12,.4)" sw={4} j={1} seed={seed + sd + 12} />
-          </g>);
-        })}
-        <Shape pts={[[-6, hy + 12], [0, hy + 32], [11, hy + 29]]} closed={false} sw={4} op={.55} j={1} seed={seed + 14} />
-        {talking ? <Shape pts={ell(0, y0 + (5 + 28 * mouth) * .4, 18 + 10 * mouth, 5 + 28 * mouth, 8)} fill="#190b0c" sw={4} seed={seed + 15} j={1.2} />
-          : mo === 'smile' ? <Shape pts={[[-34, y0 - 6], [0, y0 + 18], [34, y0 - 6]]} closed={false} sw={6} seed={seed + 16} j={1} />
-          : mo === 'frown' ? <Shape pts={[[-30, y0 + 10], [0, y0 - 10], [30, y0 + 10]]} closed={false} sw={6} seed={seed + 16} j={1} />
-          : mo === 'o' ? <Shape pts={ell(0, y0 + 6, 14, 19, 8)} fill="#190b0c" sw={4} seed={seed + 16} j={1} />
-          : mo === 'grin' ? <g>
-              <Shape pts={[[-58, y0 - 16], [-30, y0 + 22], [0, y0 + 34], [30, y0 + 22], [58, y0 - 16], [0, y0 + 2]]} fill="#12080a" sw={4} seed={seed + 16} j={1.2} />
-              {[-3, -2, -1, 0, 1, 2, 3].map((i) => <path key={i} d={`M${i * 14} ${y0 - 2 + Math.abs(i)}v11`} stroke="#e8e0cc" strokeWidth="3.5" />)}
-            </g>
-          : <Shape pts={[[-28, y0], [0, y0 + 3], [28, y0]]} closed={false} sw={6} seed={seed + 16} j={1} />}
-        {shade > 0 && <Poly pts={Array.from({length: 9}, (_, i) => { const a = Math.PI / 2 + i / 8 * Math.PI; return [Math.cos(a) * 90, hy + Math.sin(a) * 99]; })} fill="#000" stroke="none" op={shade * .5} seed={seed + 17} />}
-      </g>}
-      {extra}
-    </g>
-  );
-};
-
-/* ================================== props =================================== */
-const Candle = ({x, y, t, k = 1, seed = 1, lit = 1}) => {
-  const fl = 1 + .12 * Math.sin(t / 3.3 + seed) + .08 * Math.sin(t / 1.7 + seed * 2);
-  const sw = Math.sin(t / 9 + seed) * 3;
-  return (<g>
-    <Poly pts={[[x - 16 * k, y - 90 * k], [x + 16 * k, y - 90 * k], [x + 18 * k, y], [x - 18 * k, y]]} fill="#d6ccae" seed={seed + 20} sw={3.5} />
-    {lit > 0 && <g>
-      <Glow x={x} y={y - 125 * k} r={300 * k * fl} op={.85 * lit} />
-      <Shape pts={[[x + sw, y - 96 * k - 70 * k * fl * lit], [x + 17 * k, y - 125 * k], [x, y - 96 * k], [x - 17 * k, y - 125 * k]]} fill="#ffd36a" sw={2.5} seed={seed + 21} j={1} />
-      <Shape pts={[[x + sw * .6, y - 140 * k], [x + 7 * k, y - 120 * k], [x, y - 103 * k], [x - 7 * k, y - 120 * k]]} fill="#fff4c4" stroke="none" seed={seed + 22} j={.6} />
-    </g>}
-  </g>);
-};
-const Gift = ({x, y, k = 1, col = '#5a4a2c', seed = 1}) => (<g>
-  <Poly pts={[[x - 50 * k, y - 60 * k], [x + 50 * k, y - 60 * k], [x + 50 * k, y], [x - 50 * k, y]]} fill={col} seed={seed} sw={3.5} />
-  <rect x={x - 7 * k} y={y - 60 * k} width={14 * k} height={60 * k} fill="#cdb872" />
-  <path d={`M${x} ${y - 60 * k}q-30 -40 -42 -12q10 22 42 12q32 10 42 -12q-12 -28 -42 12`} fill="#cdb872" stroke={INK} strokeWidth="3" />
-</g>);
-const Table = ({y = 1330}) => (<g>
-  <Poly pts={[[60, y], [1020, y], [1060, y + 50], [20, y + 50]]} fill={C.b3} seed={51} sw={5} />
-  <Poly pts={[[40, y + 50], [1040, y + 50], [1040, y + 190], [40, y + 190]]} fill={C.b1} seed={52} sw={5} />
-  <Poly pts={[[70, y + 190], [130, y + 190], [120, y + 560], [80, y + 560]]} fill={C.b2} seed={53} />
-  <Poly pts={[[950, y + 190], [1010, y + 190], [1000, y + 560], [960, y + 560]]} fill={C.b2} seed={54} />
-</g>);
-const Chair = ({x, y}) => (<g>
-  <Poly pts={[[x - 62, y - 340], [x + 62, y - 340], [x + 66, y - 130], [x - 66, y - 130]]} fill={C.b2} seed={61} />
-  {[-36, 0, 36].map((o, i) => <rect key={i} x={x + o - 6} y={y - 320} width="12" height="170" fill={C.b1} />)}
-</g>);
-const Dust = ({t}) => (<g>{Array.from({length: 28}, (_, i) => {
-  const x = mod(h(i * 7.1) * W + Math.sin(t / 90 + i) * 40, W), y = mod(h(i * 3.3) * H - t * (.2 + .3 * h(i * 1.7)), H);
-  return <circle key={i} cx={x} cy={y} r={1.4 + 2.2 * h(i * 5.5)} fill="#f2e2a0" opacity={.15 + .25 * Math.abs(Math.sin(t / 40 + i))} />;
-})}</g>);
-
-const Room = ({t, lampOn = 1, mx = 270, moon = 1, win = true}) => {
-  const fl = .9 + .07 * Math.sin(t / 8.3) + .04 * Math.sin(t / 2.7 + 1.3);
-  const lx = 870, ly = 1150;
-  return (<g>
-    <rect width={W} height={H} fill="url(#gWall)" />
-    {Array.from({length: 14}, (_, i) => <rect key={i} x={i * 80 + 30} width="5" height="1320" fill="#0f1836" opacity=".5" />)}
-    <Poly pts={[[0, 1318], [W, 1318], [W, 1394], [0, 1394]]} fill={C.b1} seed={3} />
-    <rect y="1394" width={W} height="526" fill="url(#gFloor)" />
-    {Array.from({length: 9}, (_, i) => { const x0 = i * 135 - 30; return <path key={i} d={`M${x0} 1394L${540 + (x0 - 540) * 1.76} 1920`} stroke={C.b0} strokeWidth="4" opacity=".8" />; })}
-    {[1470, 1570, 1710].map((yy, i) => <path key={i} d={`M0 ${yy}L${W} ${yy}`} stroke={C.b0} strokeWidth="3" opacity=".6" />)}
-    {win && <g>
-      <Poly pts={[[90, 330], [390, 330], [390, 800], [90, 800]]} fill="url(#gWin)" seed={5} sw={7} />
-      <circle cx={mx} cy="470" r="44" fill="#dfe7f7" opacity={.9 * moon} />
-      <path d="M240 330V800M90 560H390" stroke={C.b2} strokeWidth="12" />
-      <Poly pts={[[70, 800], [410, 800], [410, 832], [70, 832]]} fill={C.b2} seed={6} />
-      <Glow x={240} y={560} r={620} g="gMoon" op={.7 * moon} />
-      <path d="M110 1400L390 1400L760 1900L120 1900Z" fill="#8fa8d8" opacity={.07 * moon} />
-      <path d="M210 1400L228 1400L420 1900L360 1900Z" fill="#05070f" opacity={.2 * moon} />
-    </g>}
-    <Poly pts={[[450, 520], [600, 520], [600, 700], [450, 700]]} fill={C.b3} seed={11} />
-    <Poly pts={[[466, 536], [584, 536], [584, 684], [466, 684]]} fill="#101a3a" seed={12} sw={3} />
-    <Poly pts={[[640, 470], [1040, 470], [1040, 1330], [640, 1330]]} fill={C.b2} seed={7} sw={6} />
-    <Poly pts={[[620, 440], [1060, 440], [1060, 492], [620, 492]]} fill={C.b3} seed={8} />
-    <Poly pts={[[665, 520], [835, 520], [835, 1290], [665, 1290]]} fill={C.b1} seed={9} sw={4} />
-    <Poly pts={[[845, 520], [1015, 520], [1015, 1290], [845, 1290]]} fill={C.b1} seed={10} sw={4} />
-    <circle cx="820" cy="900" r="9" fill={C.y2} /><circle cx="860" cy="900" r="9" fill={C.y2} />
-    <Poly pts={[[560, 1150], [1080, 1150], [1080, 1394], [560, 1394]]} fill={C.b2} seed={13} sw={6} />
-    <Poly pts={[[540, 1128], [1080, 1128], [1080, 1160], [540, 1160]]} fill={C.b3} seed={14} />
-    <path d="M600 1250H1060M600 1330H1060" stroke={C.b0} strokeWidth="4" />
-    <Poly pts={[[lx - 40, ly - 14], [lx + 40, ly - 14], [lx + 30, ly], [lx - 30, ly]]} fill={C.b0} seed={15} sw={3} />
-    <path d={`M${lx} ${ly - 14}V${ly - 150}`} stroke={C.b0} strokeWidth="9" />
-    <Poly pts={[[lx - 68, ly - 250], [lx + 68, ly - 250], [lx + 104, ly - 130], [lx - 104, ly - 130]]} fill="#f0dc92" seed={16} sw={4} op={.55 + .4 * lampOn} />
-    <Glow x={lx} y={ly - 190} r={600} op={lampOn * fl} />
-    <Glow x={lx} y={ly - 190} r={200} op={lampOn * fl * .8} />
-    <Dust t={t} />
-  </g>);
-};
-
-const Tree = ({x, y, k = 1}) => {
-  const br = [[-1, -.55, .75], [1, -.7, .8], [-1, -.95, .55], [1, -1.1, .5], [0, -1.3, .45]];
-  return (<g stroke="#05070d" strokeLinecap="round" fill="none">
-    <path d={`M${x} ${y}Q${x + 8 * k} ${y - 200 * k} ${x} ${y - 380 * k}`} strokeWidth={26 * k} />
-    {br.map((q, i) => {
-      const sx = x, sy = y - 380 * k * (.35 + i * .14), ex = sx + q[0] * 190 * k * q[2] * 1.2, ey = sy + q[1] * 150 * k;
-      return <path key={i} d={`M${sx} ${sy}Q${(sx + ex) / 2} ${sy - 30 * k} ${ex} ${ey}`} strokeWidth={(12 - i) * k} />;
-    })}
-  </g>);
-};
-const Stone = ({x, y, k, seed}) => (<g>
-  <Shape pts={[[x - 42 * k, y], [x - 42 * k, y - 110 * k], [x - 26 * k, y - 152 * k], [x, y - 162 * k], [x + 26 * k, y - 152 * k], [x + 42 * k, y - 110 * k], [x + 42 * k, y]]} fill="#262b3c" seed={seed + 80} sw={4} />
-  <path d={`M${x} ${y - 125 * k}v58M${x - 18 * k} ${y - 108 * k}h36`} stroke="#0b0e18" strokeWidth={5 * k} />
-</g>);
-const Yard = ({t, scroll = 0}) => (<g>
-  <rect width={W} height={H} fill="url(#gSky2)" />
-  <circle cx="800" cy="380" r="84" fill="#e4dfc6" opacity=".85" />
-  <Glow x={800} y={380} r={520} g="gMoon" op={.6} />
-  <Shape pts={[[-80, 1060], [180, 950], [460, 1030], [760, 930], [1160, 1020], [1160, 1500], [-80, 1500]]} fill="#0a1022" stroke="none" j={5} seed={4} />
-  <Tree x={mod(150 - scroll * .3, 1500) - 200} y={1190} k={1.2} />
-  <Tree x={mod(750 - scroll * .3, 1500) - 200} y={1170} k={.95} />
-  <Shape pts={[[-80, 1260], [300, 1232], [700, 1252], [1160, 1226], [1160, 1920], [-80, 1920]]} fill="#1a130e" stroke="none" j={3} seed={6} />
-  {[0, 1, 2, 3, 4, 5].map((i) => <Stone key={i} x={mod(80 + i * 230 - scroll * .7, 1500) - 200} y={1290 + (i % 3) * 28} k={.8 + (i % 3) * .12} seed={i} />)}
-  {[0, 1, 2].map((i) => <rect key={i} x={mod(t * .3 + i * 420, 1700) - 560} y={1240 + i * 90} width="1000" height="170" fill="url(#gMist)" />)}
-</g>);
-const House = ({x, y, t}) => (<g>
-  <Poly pts={[[x - 200, y - 300], [x + 200, y - 300], [x + 200, y], [x - 200, y]]} fill="#1a1d2e" seed={41} />
-  <Poly pts={[[x - 240, y - 300], [x, y - 460], [x + 240, y - 300]]} fill="#10131f" seed={42} />
-  <Poly pts={[[x - 130, y - 230], [x - 40, y - 230], [x - 40, y - 140], [x - 130, y - 140]]} fill="#f0d98a" seed={43} sw={4} />
-  <Glow x={x - 85} y={y - 185} r={260} op={.8 + .1 * Math.sin(t / 6)} />
-  <Poly pts={[[x + 40, y - 180], [x + 130, y - 180], [x + 130, y], [x + 40, y]]} fill={C.b1} seed={44} />
-</g>);
-const Bundle = () => (<g>
-  <Shape pts={ell(10, -246, 78, 46, 10)} fill="#d8cda4" sw={4} seed={31} />
-  <Shape pts={ell(-46, -262, 30, 32, 8)} fill="#c3ab96" sw={3.5} seed={32} />
-  <path d="M-58 -262q6 5 12 0M-40 -262q6 5 12 0" stroke={INK} strokeWidth="3" fill="none" />
-</g>);
-const Cradle = ({x, y, s = 1, rot = 0, asleep = 0}) => (
-  <g transform={`translate(${x} ${y}) scale(${s}) rotate(${rot} 0 40)`}>
-    <Shape pts={[[-175, -4], [-90, 36], [0, 48], [90, 36], [175, -4], [90, 14], [0, 24], [-90, 14]]} fill={C.b3} sw={5} seed={91} />
-    <Poly pts={[[-165, -175], [165, -175], [125, -12], [-125, -12]]} fill={C.b2} seed={92} sw={5} />
-    {[-90, -30, 30, 90].map((o, i) => <path key={i} d={`M${o} -160V-30`} stroke={C.b1} strokeWidth="9" />)}
-    <Shape pts={ell(0, -168, 150, 44, 10)} fill="#d9ceaa" sw={4} seed={93} />
-    <Shape pts={ell(-60, -196, 42, 44, 9)} fill="#c2ab96" sw={4} seed={94} />
-    {asleep < .5 ? <g><circle cx="-74" cy="-200" r="5" fill={INK} /><circle cx="-46" cy="-200" r="5" fill={INK} /><path d="M-76 -182q16 14 32 0" stroke={INK} strokeWidth="4" fill="none" /></g>
-      : <path d="M-82 -200q8 6 16 0M-54 -200q8 6 16 0M-70 -184q10 5 20 0" stroke={INK} strokeWidth="3.5" fill="none" />}
-  </g>
-);
-const DoorArt = ({x0 = 270, y0 = 430, x1 = 810, y1 = 1392, open = 0, children}) => {
-  const w = x1 - x0, sx = 1 - open * .8, pw = (w - 102) / 2, ph = (y1 - y0 - 120) / 2;
-  return (<g>
-    <Poly pts={[[x0 - 34, y0 - 34], [x1 + 34, y0 - 34], [x1 + 34, y1], [x0 - 34, y1]]} fill={C.b1} seed={71} sw={6} />
-    <rect x={x0} y={y0} width={w} height={y1 - y0} fill="#06080f" />
-    {open > 0 && <rect x={x0} y={y0} width={w} height={y1 - y0} fill="url(#gOpen)" opacity={open} />}
-    <g transform={`translate(${x0} 0) scale(${sx} 1) translate(${-x0} 0)`}>
-      <Poly pts={[[x0, y0], [x1, y0], [x1, y1], [x0, y1]]} fill={C.b2} seed={72} sw={6} />
-      {[0, 1].flatMap((r) => [0, 1].map((c) => { const px = x0 + 34 + c * (pw + 34), py = y0 + 40 + r * (ph + 40);
-        return <Poly key={r * 2 + c} pts={[[px, py], [px + pw, py], [px + pw, py + ph], [px, py + ph]]} fill={C.b1} seed={73 + r * 2 + c} sw={4} />; }))}
-      <circle cx={x1 - 46} cy={(y0 + y1) / 2} r="14" fill={C.y2} stroke={INK} strokeWidth="3" />
-      {children}
-    </g>
-  </g>);
-};
-const Knife = ({k = 1, t = 0}) => (<g transform="rotate(-12)">
-  <Glow x={0} y={-70} r={150} g="gLamp" op={(.75 + .15 * Math.sin(t / 5)) * k} />
-  <Poly pts={[[-9, 10], [9, 10], [11, -130], [0, -176], [-9, -122]]} fill="#c6d1e6" seed={95} sw={3.5} op={k} />
-  <Poly pts={[[0, 10], [9, 10], [11, -130], [0, -176]]} fill="#ffcf7a" stroke="none" seed={96} op={.6 * k} />
-  <Poly pts={[[-13, 10], [13, 10], [13, 64], [-13, 64]]} fill={C.b2} seed={97} sw={3.5} op={k} />
-</g>);
-
-/* ================================= scenes =================================== */
-const bt = (beats) => (i) => beats[Math.min(i, beats.length - 1)];
-
-const Intro = ({f, d, beats, env}) => (
-  <Stage f={f} d={d} z0={1} z1={1.22} cx={560} cy={1080}>
-    <Room t={f} mx={lerp(150, 330, f / d)} />
-    <Person x={560} y={1590} s={1.3} kind="ghost" float={34} t={f} seed={2} op={.92 * E(P(f, 25, 190))} mouth={env}
-      e={{brow: .7, mo: 'flat', look: [Math.sin(f / 70) * .8, .1]}} />
-  </Stage>
-);
-
-const RoadBg = () => (<g>
-  <rect width={W} height={H} fill="url(#gSky)" />
-  <circle cx="820" cy="330" r="70" fill="#dfe5f2" opacity=".85" />
-  <Glow x={820} y={330} r={480} g="gMoon" op={.7} />
-  {Array.from({length: 24}, (_, i) => <circle key={i} cx={h(i * 3.1) * W} cy={h(i * 7.7) * 620} r={1 + h(i) * 1.8} fill="#cfd8ee" opacity={.3 + .4 * h(i * 2.2)} />)}
-  <Shape pts={[[-60, 900], [60, 780], [130, 860], [240, 730], [330, 850], [470, 800], [600, 880], [760, 760], [880, 850], [1000, 740], [1140, 880], [1140, 920], [-60, 920]]} fill="#05080f" stroke="none" seed={2} j={4} />
-  <rect y="900" width={W} height="1020" fill="#0b0e18" />
-  <path d="M470 900L610 900L1420 1920L-340 1920Z" fill="#161926" />
-  <path d="M470 900L-340 1920M610 900L1420 1920" stroke="#2a2f45" strokeWidth="6" />
-  {Array.from({length: 9}, (_, i) => { const z = (i + .5) / 9, zz = z * z, yy = 900 + 1020 * zz, hg = 20 + 170 * zz, wd = 4 + 34 * zz;
-    return <Poly key={i} pts={[[540 - wd / 2, yy], [540 + wd / 2, yy], [540 + wd * .6, yy + hg], [540 - wd * .6, yy + hg]]} fill="#d9c97d" stroke="none" op={.5} seed={i} />; })}
-  <Poly pts={[[160, 500], [174, 500], [180, 1250], [152, 1250]]} fill="#07090f" stroke="none" seed={5} />
-  <Poly pts={[[160, 490], [310, 490], [310, 516], [160, 516]]} fill="#07090f" stroke="none" seed={6} />
-  <Glow x={290} y={560} r={520} op={.9} />
-  <ellipse cx="300" cy="1300" rx="380" ry="70" fill="#f0d98a" opacity=".1" />
-</g>);
-const Car = ({x, y, k, rot, t}) => (
-  <g transform={`translate(${x} ${y}) rotate(${rot}) scale(${k})`}>
-    <Poly pts={[[-130, -50], [130, -50], [152, 62], [-152, 62]]} fill="#12141c" seed={81} sw={5} />
-    <Poly pts={[[-92, -122], [92, -122], [122, -50], [-122, -50]]} fill="#1c2030" seed={82} sw={5} />
-    <Poly pts={[[-76, -108], [76, -108], [100, -58], [-100, -58]]} fill="#3a4666" seed={83} sw={3} op={.7} />
-    <Poly pts={[[-138, 62], [-96, 62], [-96, 98], [-138, 98]]} fill="#05060a" seed={84} sw={4} />
-    <Poly pts={[[96, 62], [138, 62], [138, 98], [96, 98]]} fill="#05060a" seed={85} sw={4} />
-    <Shape pts={ell(-96, 14, 28, 17, 8)} fill="#fff6c8" sw={3} seed={86} /><Shape pts={ell(96, 14, 28, 17, 8)} fill="#fff6c8" sw={3} seed={87} />
-    <Glow x={-96} y={14} r={340} op={.9} /><Glow x={96} y={14} r={340} op={.9} />
-  </g>
-);
-const Road = ({f, d, beats, env}) => {
-  const b = bt(beats);
-  const impact = b(5) + (d - b(5)) * .2;
-  const q = Math.pow(P(f, b(3), impact + 4), 1.8);
-  const swv = E(P(f, b(4), impact));
-  const flash = f < impact ? P(f, impact - 5, impact) : Math.exp(-(f - impact) / 38);
-  const shake = f > impact ? Math.exp(-(f - impact) / 14) * 22 * Math.sin(f * 1.9) : 0;
-  const gi = E(P(f, impact + 30, impact + 150));
-  return (<Stage f={f} d={d} z0={1} z1={1.14} cx={540} cy={1200}>
-    <g transform={`translate(${shake} ${shake * .4})`}>
-      <RoadBg />
-      {f < impact && <Person x={660} y={1500} s={.85} kind="man" t={f} seed={3}
-        e={q > .55 ? {eye: 1.45, brow: 1, mo: 'o', look: [-1, -.2]} : {brow: .1, mo: 'flat', look: [Math.sin(f / 50), 0]}} />}
-      <Car x={540 + 110 * swv * q} y={905 + 700 * q} k={.18 + 2.9 * q} rot={8 * swv} t={f} />
-      <rect width={W} height={H} fill="#02040a" opacity={.55 * P(f, impact + 30, impact + 150)} />
-      {f >= impact && <Person kind="ghost" x={660} y={1500} s={.85} float={gi * 70} op={gi * .9} t={f} seed={4} mouth={env} e={{brow: .8, mo: 'flat'}} />}
-    </g>
-    <rect width={W} height={H} fill="#fff" opacity={cl(flash)} />
-  </Stage>);
-};
-
-const Calm = ({f, d, beats, env}) => {
-  const b = bt(beats);
-  const sm = E(P(f, b(1), b(1) + 40));
-  const e = {brow: lerp(.7, .35, sm), mo: sm > .5 ? 'smile' : 'flat', eye: 1, look: [Math.sin(f / 60) * .5, .2]};
-  const tears = f > b(2) ? [0, 1].map((i) => { const p = mod(f * 1.2 + i * 65, 150); return <circle key={i} cx={(i ? 1 : -1) * 38} cy={-415 + p * .9} r="6" fill="#cfe0ff" opacity={(1 - p / 150) * .9} />; }) : null;
-  return (<Stage f={f} d={d} z0={1.0} z1={1.1} cx={580} cy={800}>
-    <Room t={f} mx={330} />
-    <Person x={600} y={1960} s={2.7} kind="ghost" t={f} seed={5} mouth={env} e={e} shade={.7} aura={.4} extra={tears} />
-  </Stage>);
-};
-
-const Funeral = ({f, d, beats, env}) => {
-  const b = bt(beats);
-  const vis = (i) => E(P(f, b(2) + i * 30, b(2) + i * 30 + 50));
-  const push = E(P(f, b(3) - 20, d));
-  return (<Stage f={f} d={d} z={lerp(1.0, 1.55, push)} cx={lerp(540, 680, push)} cy={lerp(1300, 1360, push)}>
-    <Yard t={f} />
-    <Person kind="boss" x={210} y={1560} s={1.05} t={f} seed={11} op={vis(0)} e={{brow: -.1, mo: 'flat'}} />
-    <Person kind="man" x={430} y={1560} s={1.05} t={f} seed={12} op={vis(1)} e={{brow: .9, mo: 'frown', eye: 1.1, look: [0, .6]}} />
-    <Person kind="woman" x={650} y={1560} s={1.05} t={f} seed={13} op={vis(2)} e={{brow: .7, mo: 'flat', look: [0, .7]}} arms={{l: [-10, -232], r: [70, -226]}} extra={<Bundle />} />
-    <Person kind="ghost" x={900} y={1540} s={1.0} float={26} t={f} seed={14} op={.9 * E(P(f, 10, 70))} mouth={env} e={{brow: .8, mo: 'flat', look: [-.8, .5]}} />
-    <Shape pts={[[40, 1700], [200, 1610], [540, 1580], [880, 1610], [1040, 1700], [1040, 1960], [40, 1960]]} fill="#241a12" seed={15} sw={5} />
-    <Poly pts={[[520, 1590], [540, 1590], [540, 1470], [520, 1470]]} fill={C.b2} seed={16} sw={3} />
-    <Poly pts={[[490, 1510], [570, 1510], [570, 1528], [490, 1528]]} fill={C.b2} seed={17} sw={3} />
-  </Stage>);
-};
-
-const Follow = ({f, d, beats, env}) => {
-  const b = bt(beats);
-  const bossX = lerp(300, -200, E(P(f, 0, b(1))));
-  const houseX = lerp(1550, 840, E(P(f, b(2), d)));
-  const wk = (i) => Math.abs(Math.sin(f / 9 + i)) * -12;
-  const gE = {brow: Seq(f, beats, [-.7, .8, -.3]), mo: Pick(f, beats, ['frown', 'flat', 'flat']), look: [Seq(f, beats, [-1, 0, 1]), .1], eye: 1};
-  return (<Stage f={f} d={d} z0={1} z1={1.12} cx={540} cy={1300}>
-    <Yard t={f} scroll={f * 1.4} />
-    <House x={houseX} y={1330} t={f} />
-    <Person kind="boss" x={bossX} y={1450 + wk(2)} s={.7} t={f} seed={21} op={.85 * (1 - P(f, b(1) - 20, b(1)))} tilt={Math.sin(f / 9) * 2} />
-    <Person kind="man" x={560} y={1560 + wk(0)} s={1} t={f} seed={22} tilt={Math.sin(f / 9) * 2} e={{brow: .5, mo: 'flat', look: [.5, .5]}} />
-    <Person kind="woman" x={790} y={1560 + wk(1)} s={1} t={f} seed={23} tilt={Math.sin(f / 9 + 1) * 2} arms={{l: [-10, -232], r: [70, -226]}} extra={<Bundle />} e={{brow: .4, mo: 'flat', look: [.5, .3]}} />
-    <Person kind="ghost" x={260 + Math.sin(f / 50) * 20} y={1560} s={1} float={36} t={f} seed={24} op={.9} mouth={env} e={gE} />
-  </Stage>);
-};
-
-const Nursery = ({f, d, beats, env}) => {
-  const b = bt(beats);
-  const par = E(P(f, b(3), b(3) + 40));
-  const leave = E(P(f, b(4) + 20, b(4) + 130));
-  const rock = f > b(4) + 60 ? Math.sin((f - b(4)) / 26) * 7 : Math.sin(f / 70) * 1.5;
-  const asleep = P(f, b(4) + 40, b(4) + 140);
-  const pe = {eye: .5, brow: .8, mo: 'flat', look: [.3, .8]};
-  return (<Stage f={f} d={d} z0={1} z1={1.18} cx={620} cy={1250}>
-    <Room t={f} mx={330} lampOn={.85} />
-    <Person kind="woman" x={110 - 520 * leave} y={1560} s={1.1} t={f} seed={31} op={par} tilt={5} e={pe} />
-    <Person kind="man" x={300 - 520 * leave} y={1560} s={1.1} t={f} seed={32} op={par} tilt={5} e={pe} />
-    <Cradle x={610} y={1610} s={1.2} rot={rock} asleep={asleep} />
-    <Person kind="ghost" x={960} y={1600} s={1.25} flip={-1} float={0} t={f} seed={33} op={.92} mouth={env}
-      arms={{r: [128, -210 + rock * 3]}} e={{brow: .3, mo: 'smile', eye: .95, look: [-1, .6]}} />
-  </Stage>);
-};
-
-const Aware = ({f, d, beats, env}) => {
-  const b = bt(beats);
-  const ge = Seq(f, beats, [0, .6, .9, 1, 1]);
-  const pe = {eye: Seq(f, beats, [1, 1.35, 1.1, 1, 1]), brow: Seq(f, beats, [0, .9, .4, .2, .1]), mo: Pick(f, beats, ['flat', 'o', 'flat', 'smile', 'smile']), look: [Seq(f, beats, [0, 1, 1, 1, 1]), 0]};
-  return (<Stage f={f} d={d} z0={1} z1={1.2} cx={600} cy={1200}>
-    <Room t={f} mx={lerp(120, 360, P(f, 0, b(2)))} />
-    <Person kind="man" x={330} y={1470} s={1.15} t={f} seed={6} e={pe} />
-    <Person kind="woman" x={680} y={1470} s={1.15} t={f} seed={7} e={pe} />
-    <Person kind="ghost" x={960} y={1540} s={1} float={26} flip={-1} op={.75 * E(P(f, b(1) - 20, b(1) + 40))} t={f} seed={8} mouth={env} aura={.35 + .3 * ge} e={{brow: .6, mo: 'smile', eye: .9, look: [-1, .2]}} />
-    <Table />
-  </Stage>);
-};
-
-const Anniv = ({f, d, beats, env}) => {
-  const b = bt(beats);
-  const lit = E(P(f, b(0) + 15, b(0) + 55));
-  const gIn = E(P(f, b(3) - 10, b(3) + 70));
-  const fe = {eye: .95, brow: .2, mo: 'smile', look: [Seq(f, beats, [0, 0, 0, -1]), 0]};
-  const bun = E(P(f, b(2) - 10, b(2) + 40));
-  const cols = [C.y2, '#3b4a78', '#7a5a40'];
-  return (<Stage f={f} d={d} z0={1} z1={1.22} cx={540} cy={1250}>
-    <Room t={f} lampOn={.4} mx={380} />
-    <g opacity={bun}>
-      <path d="M0 340Q540 700 1080 340" stroke={C.b3} strokeWidth="4" fill="none" />
-      {Array.from({length: 10}, (_, i) => { const u = (i + .5) / 10, xx = 1080 * u + Math.sin(f / 30 + i) * 3, yy = 340 + 720 * u * (1 - u);
-        return <Poly key={i} pts={[[xx - 28, yy], [xx + 28, yy], [xx, yy + 80]]} fill={cols[i % 3]} seed={100 + i} sw={3} op={.85} />; })}
-    </g>
-    <Chair x={190} y={1500} />
-    <Person kind="ghost" x={190} y={1490} s={1} t={f} seed={41} op={.9 * gIn} mouth={env} aura={.3 + .5 * gIn} e={{brow: .3, mo: 'smile', look: [1, .2]}} />
-    <Person kind="man" x={470} y={1470} s={1} t={f} seed={42} e={fe} />
-    <Person kind="child" x={690} y={1470} s={.85} t={f} seed={43} e={fe} />
-    <Person kind="woman" x={900} y={1470} s={1} t={f} seed={44} e={fe} />
-    <Table />
-    <Poly pts={[[330, 1332], [400, 1332], [396, 1300], [334, 1300]]} fill="#3b4a78" seed={45} sw={3} />
-    <Poly pts={[[760, 1332], [830, 1332], [826, 1300], [764, 1300]]} fill="#3b4a78" seed={46} sw={3} />
-    <Glow x={590} y={1250} r={720} op={.45 * lit} />
-    <Candle x={590} y={1372} k={1.5} t={f} seed={47} lit={lit} />
-  </Stage>);
-};
-
-const DoorS = ({f, d, beats, env}) => {
-  const b = bt(beats);
-  const hits = [];
-  { let t = b(0) + 30, gap = 100; while (t < d) { hits.push(t); t += gap; gap = Math.max(32, gap * .8); } }
-  const a = cl(hits.reduce((s, t) => (f >= t ? s + Math.exp(-(f - t) / 7) * Math.cos((f - t) * 1.7) : s), 0), -1.5, 1.5);
-  const lamp = cl(.75 - .35 * Math.abs(a) + .1 * Math.sin(f / 4), .2, 1);
-  const crack = P(f, b(2), d);
-  const sx = Math.sin(f / 25) * 18;
-  const ge = {brow: Seq(f, beats, [1, .2, -.6, -.9, -.9]), eye: Seq(f, beats, [1.2, 1, 1, 1.1, 1.2]), look: [Seq(f, beats, [-.6, -.3, 0, 0, 0]), Seq(f, beats, [-.3, 0, 0, 0, 0])], mo: 'flat'};
-  return (<Stage f={f} d={d} z0={1} z1={1.3} cx={540} cy={1000}>
-    <Room t={f} lampOn={lamp} win={false} mx={0} moon={.5} />
-    <g transform={`translate(${a * 9} ${Math.abs(a) * 3})`}>
-      <DoorArt>
-        <g stroke="#05070d" strokeWidth="6" fill="none" strokeLinecap="round" opacity={crack}>
-          <path d="M420 460L450 640L410 760L470 900" /><path d="M700 470L670 700L720 860" /><path d="M560 1040L600 1200L540 1300" />
-        </g>
-      </DoorArt>
-    </g>
-    <path d="M300 1394L780 1394L880 1520L200 1520Z" fill="#cfe0ff" opacity=".1" />
-    <rect x="300" y="1378" width="480" height="16" fill="#dce8ff" opacity=".6" />
-    <Shape pts={ell(450 + sx, 1386, 32, 9, 8)} fill="#000" stroke="none" seed={51} />
-    <Shape pts={ell(560 + sx, 1386, 32, 9, 8)} fill="#000" stroke="none" seed={52} />
-    <Person kind="ghost" x={540} y={1650} s={1.5} t={f} seed={53} op={.95} mouth={env} glow={Seq(f, beats, [0, 0, .2, .5, .9])} aura={.5 + .3 * env} e={ge} />
-  </Stage>);
-};
-
-const Power = ({f, d, beats, env}) => {
-  const b = bt(beats);
-  const g = E(P(f, b(1), b(3)));
-  const flow = E(P(f, b(0) + 10, b(2)));
-  const kn = E(P(f, b(4) - 25, b(4) + 25));
-  const cam = E(P(f, b(4) - 10, b(4) + 90));
-  const src = [[170, 1390], [930, 1370], [330, 1610]];
-  const tr = kn * (Math.sin(f * 1.3) * env * 3);
-  const base = 1.02 + .1 * P(f, 0, b(4));
-  const hand = [lerp(122, 170, kn), lerp(-172, -335, kn)];
-  return (<Stage f={f} d={d} z={lerp(base, 2.5, cam)} cx={lerp(540, 795, cam)} cy={lerp(1150, 1117, cam)}>
-    <Room t={f} lampOn={.25} mx={300} moon={.5} />
-    <Candle x={170} y={1500} k={1.2} t={f} seed={61} />
-    <Gift x={930} y={1480} k={1.3} seed={62} />
-    <Gift x={330} y={1720} k={1.1} seed={63} col="#3b4a78" />
-    {Array.from({length: 21}, (_, i) => {
-      const s = src[i % 3], u = mod(f * .011 + i / 21, 1), tx = 540, ty = 1230;
-      const qx = (s[0] + tx) / 2 + (h(i) - .5) * 160, qy = Math.min(s[1], ty) - 180;
-      const px = (1 - u) * (1 - u) * s[0] + 2 * u * (1 - u) * qx + u * u * tx, py = (1 - u) * (1 - u) * s[1] + 2 * u * (1 - u) * qy + u * u * ty;
-      return <circle key={i} cx={px} cy={py} r={5 + 5 * h(i * 2)} fill="#ffe9a0" opacity={Math.sin(u * Math.PI) * .9 * flow} style={{mixBlendMode: 'screen'}} />;
-    })}
-    <Glow x={540} y={1200} r={300 + 400 * g} g="gGhost" op={.45 + .4 * g + .2 * env} />
-    <Person kind="ghost" x={540} y={1620} s={1.5} t={f} seed={64} op={.95} mouth={env} glow={Seq(f, beats, [0, .2, .7, 1, 1, 1])} aura={.3 + .3 * g}
-      arms={{r: hand}} e={{brow: Seq(f, beats, [.3, 0, -.4, -.6, -.8, -.8]), mo: 'flat', look: [0, 0]}}
-      extra={kn > 0 && <g transform={`translate(${hand[0] + tr} ${hand[1]})`}><Knife k={kn} t={f} /></g>} />
-  </Stage>);
-};
-
-const Finale = ({f, d, beats, env}) => {
-  const b = bt(beats);
-  const sEnd = d - data.tail, rest = Math.max(30, sEnd - b(2));
-  const open = E(P(f, b(2) + rest * .3, b(2) + rest * .3 + 45));
-  const grin = E(P(f, sEnd - 6, sEnd + 40));
-  const sc = {eye: 1.35, brow: 1, mo: 'o', look: [-1, 0]};
-  const gl = Seq(f, beats, [0, .3, .8, 1]) * .8 + grin * .2;
-  return (<Stage f={f} d={d} z={lerp(1.0, 1.45, E(P(f, 0, d)))} cx={480} cy={1100}>
-    <Room t={f} lampOn={.5} win={false} mx={0} moon={.4} />
-    <DoorArt x0={70} y0={720} x1={350} y1={1392} open={open} />
-    {open > 0 && <g opacity={open * .9}><g transform="translate(215 1392) skewX(-62) scale(1.5 .34)"><Person kind="ex" shadow x={0} y={0} s={1.3} /></g></g>}
-    <Person kind="woman" x={650} y={1640} s={1.1} t={f} seed={71} arms={{r: [150, -230]}} e={sc} />
-    <Person kind="man" x={960} y={1640} s={1.1} t={f} seed={72} arms={{l: [-150, -230]}} e={sc} />
-    <Person kind="child" x={800} y={1700} s={.85} t={f} seed={73} e={sc} />
-    <Person kind="ghost" x={470} y={1600} s={1.4 * (1 + .02 * env)} float={20} t={f} seed={74} op={.96} mouth={grin > .4 ? 0 : env}
-      glow={gl} aura={.5 + .4 * gl} arms={{l: [-200, -330], r: [200, -330]}}
-      e={{brow: Seq(f, beats, [-.4, -.6, -1, -1]), eye: 1.1, mo: grin > .4 ? 'grin' : 'flat', look: [-1 * (1 - grin), 0]}} />
-  </Stage>);
-};
-
-/* ================================ composition =============================== */
-const SCENES = [Intro, Road, Calm, Funeral, Follow, Nursery, Aware, Anniv, DoorS, Power, Finale];
-
-const NOISE = (() => {
-  if (typeof document === 'undefined') return '';
-  const c = document.createElement('canvas'); c.width = c.height = 256;
-  const x = c.getContext('2d'), im = x.createImageData(256, 256);
-  let s = 12345;
-  const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
-  for (let i = 0; i < im.data.length; i += 4) { const v = Math.floor(rnd() * 255); im.data[i] = im.data[i + 1] = im.data[i + 2] = v; im.data[i + 3] = 255; }
-  x.putImageData(im, 0, 0);
-  return c.toDataURL('image/png');
-})();
-
-const SceneWrap = ({sc, idx}) => {
-  const f = useCurrentFrame();
-  const d = sc.to - sc.from;
-  const env = data.env[Math.min(sc.from + f, data.env.length - 1)] || 0;
-  const Comp = SCENES[idx];
-  const last = idx === SCENES.length - 1;
-  const op = (idx === 0 ? E(P(f, 0, 40)) : E(P(f, 0, data.half * 2))) * (last ? 1 - E(P(f, d - 100, d - 4)) : 1);
-  return <AbsoluteFill style={{opacity: op}}><Comp f={f} d={d} beats={sc.beats} env={env} /></AbsoluteFill>;
-};
-
-const Overlay = () => {
-  const f = useCurrentFrame();
-  const env = data.env[Math.min(f, data.env.length - 1)] || 0;
-  const gx = Math.floor(h(Math.floor(f / 2) * 1.3) * 256), gy = Math.floor(h(Math.floor(f / 2) * 2.9 + 5) * 256);
-  return (<AbsoluteFill style={{pointerEvents: 'none'}}>
-    <AbsoluteFill style={{background: `radial-gradient(ellipse at 50% 46%, rgba(0,0,0,0) ${36 - env * 5}%, rgba(2,3,8,.82) 100%)`}} />
-    <AbsoluteFill style={{backgroundImage: `url(${NOISE})`, backgroundSize: '256px 256px', backgroundPosition: `${gx}px ${gy}px`, mixBlendMode: 'overlay', opacity: .15}} />
-  </AbsoluteFill>);
-};
-
-export const Main = () => {
-  const frame = useCurrentFrame();
-  return (
-    <Boil.Provider value={Math.floor(frame / 5)}>
-      <AbsoluteFill style={{background: '#05070f'}}>
-        <Audio src={staticFile(data.audio)} />
-        {data.scenes.map((sc, i) => (
-          <Sequence key={i} from={sc.from} durationInFrames={sc.to - sc.from}><SceneWrap sc={sc} idx={i} /></Sequence>
-        ))}
-        <Overlay />
-      </AbsoluteFill>
-    </Boil.Provider>
-  );
-};
-'''
-
-SOURCES = {"src/index.jsx": JS_INDEX, "src/Main.jsx": JS_MAIN, "render.cjs": JS_RENDER}
-
-
-# ----------------------------------------------------------------------------- helpers
-def sh(cmd, cwd=None, check=True, capture=True):
-    p = subprocess.run(cmd, cwd=cwd, capture_output=capture, text=True, encoding="utf-8", errors="replace")
-    if check and p.returncode != 0:
-        console.print((p.stdout or "")[-2500:])
-        console.print((p.stderr or "")[-2500:])
-        die(f"command failed: {' '.join(map(str, cmd))[:200]}")
-    return p
-
-
-def find_tool(name, root):
-    p = shutil.which(name)
-    if p:
-        return [p]
-    base = root / "node_modules" / "@remotion"
-    if base.exists():
-        for d in base.glob("compositor-*"):
-            for n in (name + ".exe", name):
-                if (d / n).exists():
-                    return [str(d / n)]
-    npx = shutil.which("npx")
-    if not npx:
-        die("npx not found")
-    return [npx, "remotion", name]
-
-
-def file_hash(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for blk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(blk)
-    return h.hexdigest()
-
-
-# ----------------------------------------------------------------------------- audio analysis
-def analyze_samples(s, sr):
-    n = len(s)
-    dur = n / sr
-    ps = [0.0] * (n + 1)
-    acc = 0.0
-    for i, v in enumerate(s):
-        acc += v * v
-        ps[i + 1] = acc
+# ----------------------------------------------------------------------------- 2. voice analysis
+def analyse(force=False):
+    cache = WORK / "analysis.json"
+    key = f"{AUDIO.stat().st_size}-{int(AUDIO.stat().st_mtime)}-v4"
+    if cache.exists() and not force:
+        d = json.loads(cache.read_text(encoding="utf-8"))
+        if d.get("key") == key:
+            print("  using cached analysis"); return d
+    p = subprocess.run(["ffmpeg", "-v", "error", "-i", str(AUDIO), "-f", "f32le", "-ac", "1", "-ar", "22050", "-"],
+                       capture_output=True, check=True)
+    x = np.frombuffer(p.stdout, dtype=np.float32).astype(np.float64); sr = 22050
+    dur = len(x) / sr
     nf = int(math.ceil(dur * FPS))
-    hw = sr / FPS
-    rms = []
-    for i in range(nf):
-        c = (i + .5) / FPS * sr
-        lo, hi = max(0, int(c - hw)), min(n, int(c + hw))
-        rms.append(math.sqrt(max(0.0, ps[hi] - ps[lo]) / max(1, hi - lo)))
-    srt = sorted(rms)
-    ref = max(srt[int(.95 * (nf - 1))], 1e-5)
-    floor = srt[int(.05 * (nf - 1))] / ref
-    norm = [min(1.3, r / ref) for r in rms]
-    thr = min(.09, max(.03, 4 * floor))
-    voiced = [x >= thr for x in norm]
-    if True not in voiced:
-        die("No speech detected in the audio file.")
-    first = voiced.index(True)
-    last = nf - 1 - voiced[::-1].index(True)
-    sil, i = [], first
-    while i <= last:
-        if not voiced[i]:
+    cs = np.concatenate([[0.0], np.cumsum(x * x)])
+    e = np.minimum((np.arange(nf + 1) * sr / FPS).astype(int), len(x))
+    rms = np.sqrt((cs[e[1:]] - cs[e[:-1]]) / np.maximum(1, e[1:] - e[:-1]))
+    db = 20 * np.log10(rms + 1e-9)
+    p95 = np.percentile(rms, 95) + 1e-9
+    raw = np.clip(rms / p95, 0, 1.4)
+    env = np.zeros(nf); v = 0.0
+    for i in range(nf):                       # fast attack, slow release -> feels like breath of the voice
+        v += (raw[i] - v) * (0.55 if raw[i] > v else 0.10); env[i] = v
+    silent = db < -35
+    # pauses >= 0.3 s
+    pauses, i = [], 0
+    while i < nf:
+        if silent[i]:
             j = i
-            while j <= last and not voiced[j]:
-                j += 1
-            if (j - i) / FPS >= MIN_SIL:
-                sil.append((i / FPS, j / FPS))
+            while j < nf and silent[j]: j += 1
+            if j - i >= int(0.3 * FPS): pauses.append((i, j))
             i = j
-        else:
-            i += 1
-    mouth, m = [], 0.0
-    for x in norm:
-        v = min(1.0, max(0.0, (x - .06) * 1.7))
-        m = max(v, m * .8)
-        mouth.append(round(m, 3))
-    return {"dur": dur, "nf": nf, "mouth": mouth, "sil": sil, "t0": first / FPS, "t1": (last + 1) / FPS, "thr": thr}
+        else: i += 1
+    # ---- sentence-level alignment: choose, among the real pauses, the ones that best fit the story's sentence lengths
+    sents = [c for ln in SENT_LINES for c in ln]
+    para_end = set(); k = -1
+    for ln in SENT_LINES:
+        k += len(ln); para_end.add(k)
+    rate = (np.count_nonzero(~silent) / FPS) / sum(sents)          # seconds of speech per character
+    P = [(a, b) for a, b in pauses if a > 0.5 * FPS]               # candidate sentence boundaries
+    M, NP = len(sents), len(P); INF = 1e18
+    dp = [[INF] * NP for _ in range(M)]; back = [[-1] * NP for _ in range(M)]
+    def seg_cost(i, t0, t1):
+        exp = sents[i] * rate; act = max(0.05, (t1 - t0) / FPS)
+        return ((act - exp) / (exp + 0.8)) ** 2
+    def bonus(i, j):
+        dur = (P[j][1] - P[j][0]) / FPS
+        return -(1.2 + (1.6 if i in para_end else 0)) * min(dur, 1.2)
+    for j in range(NP):
+        dp[0][j] = seg_cost(0, 0, P[j][0]) + bonus(0, j)
+    for i in range(1, M - 1):
+        for j in range(i - 1, NP):
+            for jp in range(j):
+                if dp[i - 1][jp] >= INF: continue
+                c = dp[i - 1][jp] + seg_cost(i, P[jp][1], P[j][0]) + bonus(i, j)
+                if c < dp[i][j]: dp[i][j] = c; back[i][j] = jp
+    best, bj = INF, -1
+    for j in range(NP):
+        if dp[M - 2][j] < INF:
+            c = dp[M - 2][j] + seg_cost(M - 1, P[j][1], nf)
+            if c < best: best, bj = c, j
+    ends = [0] * (M - 1); j = bj
+    for i in range(M - 2, -1, -1):
+        ends[i] = j; j = back[i][j]
+    sent_t = [int((P[j][0] + P[j][1]) / 2) for j in ends]           # cut in the middle of the pause
+    bounds = [0]; idx = 0
+    for n in SCENE_SENTS[:-1]:
+        idx += n; bounds.append(sent_t[idx - 1])
+    bounds.append(nf)
+    scenes = [dict(i=i, name=SCENES[i][0], start=bounds[i], end=bounds[i + 1], tension=SCENES[i][2]) for i in range(len(SCENES))]
+    d = dict(key=key, fps=FPS, frames=nf, duration=dur, env=[round(float(a), 3) for a in env], scenes=scenes)
+    d["events"] = make_events([(s["start"] / FPS, s["end"] / FPS) for s in scenes])
+    WORK.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(d), encoding="utf-8")
+    return d
 
+def make_events(S):
+    """Every sound AND every visual accent is driven by this single list -> picture and sound can't drift apart."""
+    ev = []
+    def add(t, typ, v=1.0, dur=0.0): ev.append(dict(t=round(t, 3), type=typ, v=v, dur=round(dur, 3)))
+    st = lambda i: S[i][0]; en = lambda i: S[i][1]; du = lambda i: S[i][1] - S[i][0]
+    at = lambda i, f: S[i][0] + du(i) * f
+    add(0.10, "alert", 1.0, 1.45); add(0.10, "buzz", 1.0, 1.4)
+    add(at(1, .55), "creak", .5, 1.2)
+    add(en(2) - 1.0, "lampoff", 1, .2)
+    add(at(4, .08), "step", .5); add(at(4, .18), "step", .5); add(at(4, .28), "step", .5); add(at(4, .37), "step", .5)
+    add(at(4, .52), "creak", .8, 1.3); add(at(4, .78), "thud", 1.0)
+    add(at(5, .10), "sent"); add(at(5, .28), "sent"); add(at(5, .64), "pop")
+    add(at(6, .08), "sent"); add(at(6, .46), "pop")
+    add(st(7), "swoosh", 1.0, du(7)); add(st(7), "ticks", 1.0, du(7))
+    add(st(8), "alert", 1.1, 2.0); add(st(8), "boom", 1.0, 3.0)
+    for k in range(3): add(at(8, .45) + k * .55, "knock", .35)
+    for k in range(3): add(at(8, .76) + k * .5, "knock", .3)
+    for k in range(8): add(at(9, .04 + k * .11), "step", .75)
+    add(at(9, .35), "scratch", .8, 1.0); add(at(9, .72), "scratch", .9, 1.1)
+    add(st(10), "boom", .9, 3.0)
+    add(st(10), "siren", 1.0, du(10) + 1.0); add(at(10, .45), "siren2", .55, du(10) * .55 + 1.0)
+    add(st(10) + 2.0, "rumble", .35, max(1.0, du(10) - 2.5))
+    add(st(11), "siren", .35, du(11) + du(12) + 0.5)
+    add(st(11), "caralarm", .75, du(11) + du(12) * .7)
+    for f in (.12, .45, .78): add(at(11, f), "crash", 1.0)
+    add(at(12, .12), "sent"); add(at(12, .32), "sent"); add(at(12, .52), "sent")
+    add(st(13) - .4, "siren", 1.15, du(13) + 1.2); add(st(13) - .2, "siren2", .8, du(13) + 1.0)
+    add(st(13), "rumble", 1.0, du(13)); add(st(13), "boom", .9, 3.0)
+    for f in (.2, .45, .7): add(at(13, f), "crash", .55)
+    add(en(14) - 1.15, "knock", 1.0); add(en(14) - .62, "knock", 1.0)
+    add(at(15, .10), "shout", 1.0, 2.2); add(at(15, .36), "knock", 1.0); add(at(15, .39), "knock", 1.0)
+    add(at(15, .43), "shout", .9, 1.6); add(at(15, .60), "rattle", 1.0, .9)
+    add(at(15, .68), "knock", 1.0); add(at(15, .715), "knock", 1.0); add(at(15, .75), "knock", 1.0)
+    add(at(15, .80), "shout", 1.0, 1.8); add(en(15) - 2.2, "bang", 1.0); add(en(15) - 1.6, "boom", 1.0, 3.0)
+    ev.sort(key=lambda e: e["t"]); return ev
 
-def decode_audio(audio, ff, root):
-    cmd = ff + ["-v", "error", "-i", str(audio), "-f", "f32le", "-ac", "1", "-ar", str(SR), "-"]
-    p = subprocess.run(cmd, cwd=root, capture_output=True)
-    if p.returncode != 0 or len(p.stdout) < 4:
-        die("ffmpeg could not decode the audio:\n" + p.stderr.decode("utf-8", "replace")[-1500:])
-    s = array("f")
-    s.frombytes(p.stdout[: len(p.stdout) // 4 * 4])
-    return s
+# ----------------------------------------------------------------------------- 3. sound design (numpy synth)
+RNG = np.random.default_rng(7)
+def tt(n): return np.arange(n) / SR
+def noise(n): return RNG.standard_normal(n)
+def fbp(x, lo=None, hi=None):
+    X = np.fft.rfft(x); f = np.fft.rfftfreq(len(x), 1 / SR); m = np.ones_like(f)
+    if lo: m = m / np.sqrt(1 + (lo / np.maximum(f, 1e-3)) ** 4)
+    if hi: m = m / np.sqrt(1 + (f / hi) ** 4)
+    return np.fft.irfft(X * m, len(x))
+def fade(x, a=.01, b=.03):
+    n = len(x); na, nb = max(1, int(a * SR)), max(1, int(b * SR)); w = np.ones(n)
+    w[:na] = np.linspace(0, 1, na); w[-nb:] = np.minimum(w[-nb:], np.linspace(1, 0, nb)); return x * w
+def saw(ph, h=8): return sum(np.sin(k * ph) / k for k in range(1, h + 1))
+def echo(x, taps=((.31, .45), (.73, .28))):
+    y = x.copy()
+    for d, g in taps:
+        k = int(d * SR)
+        if k < len(x): y[k:] += x[:-k] * g
+    return y
 
+def s_knock(v, far=False):
+    n = int(.5 * SR); t = tt(n)
+    body = np.sin(2 * np.pi * (92 + 70 * np.exp(-t * 30)) * t) * np.exp(-t * 13)
+    wood = .5 * np.sin(2 * np.pi * 230 * t) * np.exp(-t * 20) + .25 * np.sin(2 * np.pi * 415 * t) * np.exp(-t * 28)
+    click = .8 * fbp(noise(n), 600, 3500) * np.exp(-t * 90)
+    x = (body + wood + click) * v
+    return fbp(x, None, 520) * 1.5 if far else x
+def s_thump(f0=62, d=.25, a=1.0):
+    n = int(d * SR); t = tt(n); return a * np.sin(2 * np.pi * f0 * (1 + .5 * np.exp(-t * 25)) * t) * np.exp(-t * 17) * (1 - np.exp(-t * 500))
+def s_step(v):
+    n = int(.3 * SR); t = tt(n)
+    return v * (s_thump(68, .3, 1.0) + .5 * fbp(noise(n), 70, 380) * np.exp(-t * 22) + .25 * fbp(noise(n), 900, 3000) * np.exp(-t * 60))
+def s_creak(v, d):
+    n = int(d * SR); t = tt(n); f = 135 + 80 * (t / d) ** 1.5 + 7 * np.sin(2 * np.pi * 9 * t)
+    ph = 2 * np.pi * np.cumsum(f) / SR; x = fbp(saw(ph, 10), 320, 1900) * np.sin(np.pi * t / d) ** 1.6
+    return v * .5 * x / (np.abs(x).max() + 1e-9)
+def s_buzz(d):
+    n = int(d * SR); t = tt(n); gate = (np.sin(2 * np.pi * 3.3 * t) > -.15).astype(float)
+    x = fbp(noise(n), 90, 800) * (.55 + .45 * np.sign(np.sin(2 * np.pi * 52 * t))) + .35 * np.sin(2 * np.pi * 150 * t)
+    return fade(x * gate, .02, .05) * .55
+def s_alert(v, d):
+    n = int(d * SR); t = tt(n); x = np.sin(2 * np.pi * 853 * t) + np.sin(2 * np.pi * 960 * t)
+    return fade(fbp(x, 300, 3600), .02, .08) * .26 * v
+def s_pop():
+    n = int(.4 * SR); t = tt(n); return (np.sin(2 * np.pi * 880 * t) * np.exp(-t * 14) + .8 * np.sin(2 * np.pi * 1320 * (t - .09).clip(0)) * np.exp(-(t - .09).clip(0) * 12) * (t > .09)) * .4
+def s_sent():
+    n = int(.32 * SR); t = tt(n); return fbp(noise(n), 1400, 7000) * np.sin(np.pi * t / .32) ** 2 * .3
+def s_swoosh(d):
+    n = int(d * SR); t = tt(n); x = fbp(noise(n), 400, 5000) * (t / d) ** 2; return fade(x, .2, .2) * .5
+def s_ticks(d):
+    n = int(d * SR); x = np.zeros(n); tm = 0.0; k = 0
+    while tm < d:
+        rate = 3 + 11 * min(1, tm / (d * .7)); i = int(tm * SR); m = int(.05 * SR)
+        if i + m < n:
+            t = tt(m); c = fbp(noise(m), 1500, 6500) * np.exp(-t * 400) + np.sin(2 * np.pi * (1100 if k % 2 else 780) * t) * np.exp(-t * 90) * .6
+            x[i:i + m] += c
+        tm += 1 / rate; k += 1
+    return x * .45
+def s_siren(d, kind="wail"):
+    n = int(d * SR); t = tt(n)
+    if kind == "wail":
+        f = 400 + 420 * (.5 - .5 * np.cos(2 * np.pi * t / 8.5)); x = saw(2 * np.pi * np.cumsum(f) / SR, 6)
+    else:
+        f = np.where((t % 1.9) < .95, 435, 585); f = np.convolve(f, np.ones(400) / 400, "same"); x = saw(2 * np.pi * np.cumsum(f) / SR, 5)
+    x = echo(fbp(x, None, 1800)); return fade(x, .8, .9) * .3
+def s_caralarm(d):
+    n = int(d * SR); t = tt(n); f = 750 + 750 * ((t * 3.2) % 1) ** .7
+    x = np.sign(np.sin(2 * np.pi * np.cumsum(f) / SR)); gate = ((t % 2.3) < 1.8).astype(float)
+    return echo(fbp(x * gate, 400, 2300), ((.4, .4),)) * .22
+def s_crash(v):
+    n = int(1.7 * SR); t = tt(n); x = fbp(noise(n), 150, 5000) * np.exp(-t * 4.5) + 1.1 * s_thump(55, 1.7, 1) * np.exp(-t * 2)
+    for _ in range(14):
+        i = int(RNG.uniform(.05, .9) * SR); m = int(.05 * SR)
+        x[i:i + m] += fbp(noise(m), 3500, 9500) * np.exp(-tt(m) * 140) * RNG.uniform(.3, .8)
+    return v * .8 * x / (np.abs(x).max() + 1e-9)
+def s_scratch(v, d):
+    n = int(d * SR); t = tt(n); am = np.clip(np.sin(2 * np.pi * 2.6 * t) , 0, 1) ** 2
+    return v * .45 * fbp(noise(n), 2200, 6500) * am * np.sin(np.pi * t / d)
+def s_rumble(v, d):
+    n = int(d * SR); t = tt(n); am = .6 + .4 * np.sin(2 * np.pi * 7 * t + np.sin(2 * np.pi * .7 * t) * 3)
+    x = fbp(noise(n), 20, 110) * 6 * am + .5 * np.sin(2 * np.pi * 38 * t) + .3 * np.sin(2 * np.pi * 52 * t)
+    return fade(x, .8, .8) * v * .55
+def s_boom(v, d):
+    n = int(d * SR); t = tt(n); x = np.sin(2 * np.pi * 46 * t) * np.exp(-t * 2.3) + 2.5 * fbp(noise(n), None, 140) * np.exp(-t * 3)
+    return v * .9 * x
+def s_shout(v, d):
+    n = int(d * SR); t = tt(n); f0 = 128 + 28 * np.sin(2 * np.pi * .8 * t) + 38 * (t / d) + 3 * np.sin(2 * np.pi * 6 * t)
+    src = saw(2 * np.pi * np.cumsum(f0) / SR, 30); syl = np.clip(np.sin(2 * np.pi * 2.6 * t) * 3, 0, 1)
+    x = (fbp(src, 650, 950) + .8 * fbp(src, 1050, 1500) + .3 * fbp(src, 2200, 2900)) * syl
+    return v * .55 * fade(fbp(x, None, 2200), .05, .15) / 40
+def s_rattle(d):
+    n = int(d * SR); t = tt(n); return fbp(noise(n), 800, 4800) * (.5 + .5 * np.sign(np.sin(2 * np.pi * 21 * t))) * np.exp(-t * 2.4) * .55 + .2 * np.sin(2 * np.pi * 1850 * t) * np.exp(-t * 7)
+def s_click():
+    n = int(.15 * SR); t = tt(n); return fbp(noise(n), 900, 5500) * np.exp(-t * 130) * .8 + s_thump(90, .15, .6)
 
-# ----------------------------------------------------------------------------- scene alignment
-def align(sentences, sil, t0, t1):
-    """Monotonic DP: place each sentence boundary on the most plausible pause."""
-    N = len(sentences)
-    if N < 2:
-        return []
-    w = [len(x.replace(" ", "")) + 5 for x in sentences]
-    tot, cum, Ex = float(sum(w)), 0.0, []
-    for i in range(N - 1):
-        cum += w[i]
-        Ex.append(t0 + (t1 - t0) * cum / tot)
-    L = t1 - t0
-    sigma, win = max(1.5, .05 * L), min(12.0, max(3.5, .15 * L))
-    cands = []
-    for e in Ex:
-        c = []
-        for (a, b) in sil:
-            m = (a + b) / 2
-            if abs(m - e) <= win:
-                c.append((m, ((m - e) / sigma) ** 2 - 1.2 * min(b - a, 1.5)))
-        c.append((e, 2.5))
-        cands.append(c)
-    INF = 1e18
-    dp = [[INF] * len(c) for c in cands]
-    bk = [[-1] * len(c) for c in cands]
-    for j, c in enumerate(cands[0]):
-        dp[0][j] = c[1]
-    for i in range(1, len(cands)):
-        for j, c in enumerate(cands[i]):
-            best, bi = INF, -1
-            for k, pc in enumerate(cands[i - 1]):
-                if dp[i - 1][k] < best and pc[0] + MIN_BEAT <= c[0]:
-                    best, bi = dp[i - 1][k], k
-            if bi >= 0:
-                dp[i][j], bk[i][j] = best + c[1], bi
-    j = min(range(len(cands[-1])), key=lambda q: dp[-1][q])
-    if dp[-1][j] >= INF:
-        return Ex
-    out = [0.0] * len(cands)
-    for i in range(len(cands) - 1, -1, -1):
-        out[i] = cands[i][j][0]
-        j = bk[i][j]
-    return out
+def build_sfx(d):
+    N = int(d["duration"] * SR) + SR; L = np.zeros(N); R = np.zeros(N)
+    def put(sig, t0, pan=0.0, g=1.0):
+        i = int(t0 * SR)
+        if i >= N: return
+        sig = sig[:N - i] * g; a = (pan + 1) * math.pi / 4
+        L[i:i + len(sig)] += sig * math.cos(a); R[i:i + len(sig)] += sig * math.sin(a)
+    sc = d["scenes"]; mids = [(s["start"] + s["end"]) / 2 / FPS for s in sc]; tens = [s["tension"] for s in sc]
+    t = tt(N); ten = np.interp(t, mids, tens)
+    # --- continuous bed: drone, air, eerie high tone
+    drone = (np.sin(2 * np.pi * 55 * t + 3 * np.sin(2 * np.pi * .1 * t)) * .5 + np.sin(2 * np.pi * 58.3 * t) * .4 + np.sin(2 * np.pi * 110 * t) * .15)
+    put(drone * (.25 + .75 * ten) * .55, 0, 0)
+    put(np.sin(2 * np.pi * 3136 * t + 2 * np.sin(2 * np.pi * .13 * t)) * .02 * ten ** 2 * (.6 + .4 * np.sin(2 * np.pi * .21 * t)), 0, .2)
+    air = fbp(noise(N), 70, 520) * (.55 + .45 * np.sin(2 * np.pi * .07 * t)) * (.05 + .06 * ten) * 4
+    put(air, 0, 0)
+    # --- heartbeat (from first alert on, speeds up with tension)
+    tm = d["scenes"][1]["start"] / FPS
+    while tm < d["duration"]:
+        k = float(np.interp(tm, mids, tens)); period = 60 / (62 + 70 * k)
+        put(s_thump(60, .26, .8 + .3 * k), tm, 0, .55); put(s_thump(52, .22, .6), tm + .27, 0, .5); tm += period
+    # --- breathing (stops while she holds her breath at the end)
+    stop = d["scenes"][15]["start"] / FPS; tm = d["scenes"][3]["start"] / FPS
+    while tm < stop - 3:
+        k = float(np.interp(tm, mids, tens)); m = int(1.2 * SR)
+        put(fbp(noise(m), 600, 4200) * np.sin(np.pi * tt(m) / 1.2) ** 2 * (.07 + .08 * k), tm, 0)
+        m2 = int(1.4 * SR); put(fbp(noise(m2), 400, 3200) * np.sin(np.pi * tt(m2) / 1.4) ** 2 * (.06 + .07 * k), tm + 1.5, 0)
+        tm += 3.4 - 1.0 * k + RNG.uniform(-.2, .2)
+    # --- scripted events (same list the picture uses)
+    for e in d["events"]:
+        ty, v, du, t0 = e["type"], e["v"], max(e["dur"], .1), e["t"]
+        if ty == "knock":    put(s_knock(v, v < .5), t0, 0, .8 if v >= .5 else .9)
+        elif ty == "thud":   put(s_thump(70, .4, 1.2) + .3 * fbp(noise(int(.4 * SR)), 80, 500) * np.exp(-tt(int(.4 * SR)) * 14), t0, .3, .9)
+        elif ty == "step":   put(s_step(v), t0, RNG.uniform(-.4, .4), .6)
+        elif ty == "creak":  put(s_creak(v, du), t0, -.3, .6)
+        elif ty == "buzz":   put(s_buzz(du), t0, -.5, .9)
+        elif ty == "alert":  put(s_alert(v, du), t0, -.3, 1.0)
+        elif ty == "pop":    put(s_pop(), t0, -.2, .8)
+        elif ty == "sent":   put(s_sent(), t0, .2, .7)
+        elif ty == "swoosh": put(s_swoosh(du), t0, 0, .6)
+        elif ty == "ticks":  put(s_ticks(du), t0, .25, .8)
+        elif ty == "boom":   put(s_boom(v, du), t0, 0, .8)
+        elif ty == "siren":  put(s_siren(du, "wail"), t0, -.35, v)
+        elif ty == "siren2": put(s_siren(du, "hilo"), t0, .35, v)
+        elif ty == "caralarm": put(s_caralarm(du), t0, .6, v)
+        elif ty == "crash":  put(s_crash(v), t0, RNG.uniform(-.5, .5), .75)
+        elif ty == "scratch": put(s_scratch(v, du), t0, .1, .8)
+        elif ty == "rumble": put(s_rumble(v, du), t0, 0, .9)
+        elif ty == "shout":  put(s_shout(v, du), t0, .15, .6)
+        elif ty == "rattle": put(s_rattle(du), t0, .1, .8)
+        elif ty == "bang":   put(s_knock(1.4) * 1.3, t0, 0, .9); put(s_crash(.6), t0, 0, .8)
+        elif ty == "lampoff": put(s_click(), t0, -.6, .8)
+    m = max(np.abs(L).max(), np.abs(R).max()) + 1e-9
+    n = int(d["duration"] * SR); return L[:n] / m * .95, R[:n] / m * .95
 
+def write_wav(path, L, R):
+    a = (np.stack([L, R], 1) * 32767).astype("<i2")
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(2); w.setsampwidth(2); w.setframerate(SR); w.writeframes(a.tobytes())
 
-def build_timeline(an, scenes):
-    total = int(math.ceil((an["dur"] + TAIL_SEC) * FPS))
-    flat, owner = [], []
-    for si, (_, sents) in enumerate(scenes):
-        for s_ in sents:
-            flat.append(s_)
-            owner.append(si)
-    bounds = [round(t * FPS) for t in align(flat, an["sil"], an["t0"], an["t1"])]
-    starts = [0] + bounds
-    out = []
-    for si, (name, sents) in enumerate(scenes):
-        idx = [k for k, o in enumerate(owner) if o == si]
-        st = starts[idx[0]]
-        en = starts[idx[-1] + 1] if idx[-1] + 1 < len(starts) else total
-        fr = max(0, st - HALF) if si > 0 else 0
-        to = min(total, en + HALF) if si < len(scenes) - 1 else total
-        out.append({"id": si, "name": name, "from": fr, "to": to, "start": st, "end": en,
-                    "beats": [max(0, starts[k] - fr) for k in idx]})
-    return total, out
+def make_audio(d, sfx_gain=.60):
+    wav = WORK / "sfx_bed.wav"; mix = WORK / "final_mix.wav"
+    if not wav.exists() or not mix.exists() or wav.stat().st_mtime < (WORK / "analysis.json").stat().st_mtime:
+        print("  synthesising sound-design bed ...", flush=True)
+        L, R = build_sfx(d); write_wav(wav, L, R)
+        print("  mixing (voice on top, SFX ducked under the voice) ...", flush=True)
+        graph = (f"[0:a]aformat=sample_rates={SR}:channel_layouts=stereo,asplit=2[v][sc];"
+                 f"[1:a]volume={sfx_gain}[s];"
+                 "[s][sc]sidechaincompress=threshold=0.015:ratio=10:attack=15:release=450:makeup=1[sd];"
+                 "[v][sd]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.96[a]")
+        base = ["ffmpeg", "-y", "-v", "error", "-i", str(AUDIO), "-i", str(wav), "-filter_complex", graph, "-map", "[a]", "-ar", "48000"]
+        r = subprocess.run(base + [str(mix)], capture_output=True, text=True)
+        if r.returncode != 0:      # very old ffmpeg without amix normalize=0
+            graph = graph.replace("amix=inputs=2:duration=first:normalize=0", "amix=inputs=2:duration=first,volume=2")
+            base[base.index("-filter_complex") + 1] = graph; run(base + [str(mix)])
+    else:
+        print("  using cached audio mix")
+    return mix
 
+# ----------------------------------------------------------------------------- 4. Remotion project files
+def write_png(path, arr):
+    h, w, _ = arr.shape; raw = b"".join(b"\x00" + arr[y].tobytes() for y in range(h))
+    def ch(t, b): return struct.pack(">I", len(b)) + t + b + struct.pack(">I", zlib.crc32(t + b) & 0xffffffff)
+    Path(path).write_bytes(b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 6, 0, 0, 0)) + ch(b"IDAT", zlib.compress(raw, 6)) + ch(b"IEND", b""))
+
+def make_textures(pub):
+    r = np.random.default_rng(3)
+    g = np.clip(r.normal(128, 46, (256, 256)), 0, 255).astype(np.uint8)
+    write_png(pub / "grain.png", np.dstack([g, g, g, np.full_like(g, 255)]))
+    n = r.standard_normal((512, 512)); F = np.fft.fft2(n); fy = np.fft.fftfreq(512)[:, None]; fx = np.fft.fftfreq(512)[None, :]
+    n = np.real(np.fft.ifft2(F * np.exp(-(fx ** 2 + fy ** 2) * 900))); n = (n - n.min()) / (n.max() - n.min())
+    p = (110 + n * 70).astype(np.uint8); write_png(pub / "paper.png", np.dstack([p, p, p, np.full_like(p, 255)]))
+
+def scaffold(d):
+    src = PROJ / "src"; pub = PROJ / "public"; src.mkdir(parents=True, exist_ok=True); pub.mkdir(exist_ok=True)
+    for name, text in FILES.items():
+        f = PROJ / name; f.parent.mkdir(parents=True, exist_ok=True); f.write_text(text, encoding="utf-8")
+    (src / "analysis.json").write_text(json.dumps({k: d[k] for k in ("frames", "fps", "env", "scenes", "events")}), encoding="utf-8")
+    if not (pub / "grain.png").exists(): make_textures(pub)
+
+def which(n):
+    p = shutil.which(n) or shutil.which(n + ".cmd") or shutil.which(n + ".exe"); return p
+def npm_install():
+    if (PROJ / "node_modules" / "@remotion" / "renderer").exists(): print("  node_modules present"); return
+    npm = which("npm") or die("npm not found - install Node.js 18+ from nodejs.org")
+    print("  installing Remotion + dependencies (first run only, a few minutes) ...", flush=True)
+    p = subprocess.Popen([npm, "install", "--no-audit", "--no-fund", "--loglevel=error"], cwd=PROJ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    t = time.time()
+    while p.poll() is None:
+        line(f"  npm install ... {hms(time.time()-t)}"); time.sleep(1)
+    print()
+    if p.returncode != 0: die("npm install failed:\n" + p.stdout.read()[-1500:])
+
+# ----------------------------------------------------------------------------- 5/6. render with resume
+def probe_frames(f):
+    try:
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(f)],
+                           capture_output=True, text=True); return int(r.stdout.strip().split(",")[0])
+    except Exception: return -1
+
+def source_signature(d):
+    h = hashlib.sha1()
+    for name in sorted(FILES): h.update(FILES[name].encode())
+    h.update(json.dumps(d["scenes"]).encode()); h.update(json.dumps(d["events"]).encode()); return h.hexdigest()[:16]
+
+def render_all(d, args):
+    total = d["frames"]; CHUNKS.mkdir(parents=True, exist_ok=True); STILLS.mkdir(exist_ok=True)
+    sig = source_signature(d); sf = CHUNKS / ".sig"
+    if args.fresh or (sf.exists() and sf.read_text() != sig):
+        if any(CHUNKS.glob("chunk_*.mp4")): print("  scene timing / animation code changed -> old chunks discarded")
+        for f in CHUNKS.glob("*"): f.unlink()
+    sf.write_text(sig)
+    chunks, done_frames = [], 0
+    for idx, a in enumerate(range(0, total, CHUNK_FRAMES)):
+        b = min(total - 1, a + CHUNK_FRAMES - 1); out = CHUNKS / f"chunk_{idx:03d}.mp4"
+        if out.exists() and probe_frames(out) == b - a + 1: done_frames += b - a + 1; continue
+        if out.exists(): out.unlink()
+        chunks.append(dict(idx=idx, **{"from": a, "to": b}, out=str(out)))
+    n_chunks = math.ceil(total / CHUNK_FRAMES)
+    stills = []
+    if not args.no_preview:
+        for s in d["scenes"]:
+            fr = int(s["start"] + (s["end"] - s["start"]) * .55); stills.append(dict(frame=fr, out=str(STILLS / f"scene_{s['i']:02d}_{s['name']}.jpg")))
+    todo_stills = [s for s in stills if not Path(s["out"]).exists()]
+    if not chunks and not todo_stills:
+        print(f"  all {n_chunks} chunks already rendered - nothing to do"); return
+    print(f"  {done_frames}/{total} frames already saved from earlier runs; rendering {len(chunks)} chunk(s) of {CHUNK_FRAMES} frames", flush=True)
+    job = dict(stills=todo_stills, chunks=chunks, crf=args.crf, concurrency=args.concurrency)
+    (WORK / "job.json").write_text(json.dumps(job), encoding="utf-8")
+    node = which("node") or die("node not found")
+    p = subprocess.Popen([node, "render.mjs", str(WORK / "job.json")], cwd=PROJ, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+    t0 = time.time(); base_done = done_frames; cur = {}; finished = 0; first = None
+    for raw in p.stdout:
+        raw = raw.strip()
+        if not raw.startswith("@@"):
+            if raw and not raw.startswith("("): print("\n  " + raw[:160])
+            continue
+        m = json.loads(raw[2:]); ev = m["ev"]
+        if ev == "bundling": line("  bundling animation code ...")
+        elif ev == "bundle": line(f"  bundling animation code ... {int(m['p'])}%")
+        elif ev == "still":
+            print(f"\n  preview still saved (frame {m['frame']})  -> {STILLS}", end="")
+            if first is None: first = time.time()
+        elif ev == "frames":
+            cur[m["chunk"]] = m["done"]
+            done = base_done + sum((c["to"] - c["from"] + 1) for c in chunks if c["idx"] not in cur and c["idx"] < m["chunk"]) + m["done"]
+            el = time.time() - t0; fresh = done - base_done; rate = fresh / el if el > 1 else 0
+            eta = (total - done) / rate if rate > 0 else 0
+            line(f"  {bar(done/total)} chunk {m['chunk']+1}/{n_chunks} frame {done}/{total} {rate:4.1f} fps  elapsed {hms(el)}  eta {hms(eta)}")
+        elif ev == "chunk_done":
+            finished += 1
+        elif ev == "done": print()
+    if p.wait() != 0: die("renderer stopped. Re-run the script - finished chunks are kept and it will resume.")
+
+def assemble(d):
+    files = sorted(CHUNKS.glob("chunk_*.mp4")); need = math.ceil(d["frames"] / CHUNK_FRAMES)
+    if len(files) != need: die(f"expected {need} chunks, found {len(files)} - re-run to finish rendering")
+    lst = WORK / "concat.txt"; lst.write_text("".join(f"file '{f.as_posix()}'\n" for f in files), encoding="utf-8")
+    mix = WORK / "final_mix.wav"; dur = d["frames"] / FPS
+    cmd = ["ffmpeg", "-y", "-v", "error", "-stats", "-f", "concat", "-safe", "0", "-i", str(lst), "-i", str(mix), "-map", "0:v", "-map", "1:a",
+           "-c:v", "copy", "-c:a", "aac", "-b:a", "320k", "-t", f"{dur:.4f}", "-movflags", "+faststart", str(FINAL)]
+    print("  joining chunks + muxing audio ...", flush=True); run(cmd)
+    def sd(kind):
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", kind, "-show_entries", "stream=duration", "-of", "csv=p=0", str(FINAL)], capture_output=True, text=True)
+        try: return float(r.stdout.strip())
+        except Exception: return 0
+    v, a = sd("v:0"), sd("a:0"); n = probe_frames(FINAL)
+    print(f"  video {v:.3f}s ({n} frames) | audio {a:.3f}s | offset {abs(v-a)*1000:.0f} ms")
+    if n != d["frames"] or abs(v - a) > 0.05:
+        print("  timing mismatch from stream-copy -> re-encoding once to guarantee frame-exact sync ...", flush=True)
+        run(["ffmpeg", "-y", "-v", "error", "-stats", "-f", "concat", "-safe", "0", "-i", str(lst), "-i", str(mix), "-map", "0:v", "-map", "1:a", "-vf", f"fps={FPS}",
+             "-c:v", "libx264", "-crf", "15", "-preset", "slow", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "320k", "-t", f"{dur:.4f}", "-movflags", "+faststart", str(FINAL)])
 
 # ----------------------------------------------------------------------------- main
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--fresh", action="store_true", help="delete cached chunks and start over")
-    ap.add_argument("--stills", action="store_true", help="render one preview PNG per scene and exit")
-    args = ap.parse_args()
+    ap = argparse.ArgumentParser(); ap.add_argument("--prep-only", action="store_true"); ap.add_argument("--fresh", action="store_true")
+    ap.add_argument("--no-preview", action="store_true"); ap.add_argument("--crf", type=int, default=17); ap.add_argument("--concurrency", type=int, default=None)
+    args = ap.parse_args(); total_stages = 6
+    OUT_DIR.mkdir(parents=True, exist_ok=True); WORK.mkdir(exist_ok=True)
+    stage(1, total_stages, "checking tools")
+    for tool in ("ffmpeg", "ffprobe"): which(tool) or die(f"{tool} not found - install FFmpeg and add it to PATH")
+    if not args.prep_only: which("node") or die("Node.js not found - install Node 18+ from nodejs.org")
+    AUDIO.exists() or die(f"audio not found: {AUDIO}")
+    print("  ok")
+    stage(2, total_stages, "analysing the voice -> scene cuts locked to real pauses")
+    d = analyse(); print(f"  {d['duration']:.2f}s of audio = {d['frames']} frames @ {FPS} fps, {len(d['scenes'])} scenes, {len(d['events'])} sound/visual cues")
+    lines = [f"scene {s['i']:2d} {s['name']:10s} {s['start']/FPS:7.2f}s -> {s['end']/FPS:7.2f}s" for s in d["scenes"]]
+    (OUT_DIR / "sync_report.txt").write_text("\n".join(lines), encoding="utf-8"); print("  scene timing saved to sync_report.txt")
+    stage(3, total_stages, "sound design + mix (voice louder than effects)")
+    make_audio(d)
+    stage(4, total_stages, "building the Remotion project")
+    scaffold(d)
+    if args.prep_only: print("  prep-only: project written to", PROJ); return
+    npm_install()
+    stage(5, total_stages, "rendering (resumable - safe to stop with Ctrl+C and run again)")
+    render_all(d, args)
+    stage(6, total_stages, "assembling final video")
+    assemble(d)
+    print(f"\nDONE  ->  {FINAL}   (total {hms(time.time()-T0)})")
 
-    console.print(Panel.fit("[bold]Amar Poribar[/]  |  Remotion 2D hand-drawn horror  |  1080x1920 @ 60 fps  |  audio-locked",
-                            border_style="cyan"))
-    audio = OUT_DIR / AUDIO_NAME
-    root, cache = OUT_DIR / "remotion_project", OUT_DIR / "render_cache"
-    final = OUT_DIR / FINAL_NAME
+# ============================================================================= embedded Remotion project
+FILES = {}
+FILES["package.json"] = r'''{
+  "name": "horror-anim", "version": "1.0.0", "private": true, "type": "module",
+  "dependencies": {
+    "@remotion/bundler": "4.0.250", "@remotion/cli": "4.0.250", "@remotion/renderer": "4.0.250", "remotion": "4.0.250",
+    "react": "18.3.1", "react-dom": "18.3.1"
+  },
+  "devDependencies": { "@types/react": "18.3.3", "typescript": "5.5.4" }
+}
+'''
+FILES["tsconfig.json"] = r'''{ "compilerOptions": { "target": "ES2020", "module": "ESNext", "moduleResolution": "bundler", "jsx": "react-jsx", "strict": false, "skipLibCheck": true, "resolveJsonModule": true, "esModuleInterop": true, "noEmit": true }, "include": ["src"] }
+'''
+FILES["render.mjs"] = r'''import {bundle} from '@remotion/bundler';
+import {renderMedia, renderStill, selectComposition} from '@remotion/renderer';
+import path from 'node:path';
+import fs from 'node:fs';
+import {fileURLToPath} from 'node:url';
+const here = path.dirname(fileURLToPath(import.meta.url));
+const job = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
+const log = (o) => console.log('@@' + JSON.stringify(o));
+(async () => {
+  log({ev: 'bundling'});
+  const serveUrl = await bundle({entryPoint: path.join(here, 'src/index.ts'), publicDir: path.join(here, 'public'), onProgress: (p) => log({ev: 'bundle', p})});
+  const comp = await selectComposition({serveUrl, id: 'Main', timeoutInMilliseconds: 180000});
+  for (const s of job.stills) {
+    await renderStill({composition: comp, serveUrl, frame: s.frame, output: s.out, imageFormat: 'jpeg', jpegQuality: 92, timeoutInMilliseconds: 180000});
+    log({ev: 'still', frame: s.frame});
+  }
+  for (const c of job.chunks) {
+    const tmp = c.out + '.part.mp4';
+    let last = -1;
+    await renderMedia({
+      composition: comp, serveUrl, codec: 'h264', outputLocation: tmp, frameRange: [c.from, c.to], muted: true,
+      crf: job.crf, pixelFormat: 'yuv420p', x264Preset: 'medium', imageFormat: 'jpeg', jpegQuality: 100,
+      concurrency: job.concurrency, timeoutInMilliseconds: 240000,
+      onProgress: ({renderedFrames}) => { if (renderedFrames !== last) { last = renderedFrames; log({ev: 'frames', chunk: c.idx, done: renderedFrames}); } },
+    });
+    fs.renameSync(tmp, c.out);
+    log({ev: 'chunk_done', chunk: c.idx});
+  }
+  log({ev: 'done'});
+})().catch((e) => { console.error(e); process.exit(1); });
+'''
+FILES["src/index.ts"] = r'''import {registerRoot} from 'remotion';
+import {Root} from './Root';
+registerRoot(Root);
+'''
+FILES["src/Root.tsx"] = r'''import React from 'react';
+import {Composition} from 'remotion';
+import {Main} from './Main';
+import {A} from './lib';
+export const Root: React.FC = () => (
+  <Composition id="Main" component={Main} durationInFrames={A.frames} fps={60} width={1080} height={1920} />
+);
+'''
+FILES["src/lib.tsx"] = r'''import React from 'react';
+import data from './analysis.json';
 
-    # 1 ---- environment
-    step(1, "Environment")
-    if not audio.exists():
-        die(f"Audio not found: {audio}")
-    node, npm = shutil.which("node"), shutil.which("npm")
-    if not node or not npm:
-        die("Node.js (>=18) and npm are required: https://nodejs.org")
-    ver = sh([node, "-v"]).stdout.strip()
-    if int(ver.lstrip("v").split(".")[0]) < 18:
-        die(f"Node {ver} is too old; need >= 18")
-    console.print(f"node {ver} | audio {audio.name} ({audio.stat().st_size/1e6:.2f} MB) | output {OUT_DIR}")
-    (root / "src").mkdir(parents=True, exist_ok=True)
-    (root / "public").mkdir(parents=True, exist_ok=True)
-    cache.mkdir(parents=True, exist_ok=True)
+export const A: any = data;
+export const FPS = 60;
+export type P = [number, number];
+export const clamp = (v: number, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+export const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+export const ease = (t: number) => { t = clamp(t); return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2; };
+export const hash = (n: number) => { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); };
+export const noise = (x: number, seed = 0) => { const i = Math.floor(x), f = x - i, u = f * f * (3 - 2 * f); return lerp(hash(i + seed * 17.3), hash(i + 1 + seed * 17.3), u) * 2 - 1; };
 
-    # 2 ---- dependencies
-    step(2, "Dependencies (npm)")
-    pj = json.dumps(PACKAGE_JSON, indent=2)
-    pj_file, pj_hash = root / "package.json", root / ".pkg_hash"
-    need = (not (root / "node_modules" / "@remotion" / "renderer").exists()
-            or not pj_file.exists() or pj_file.read_text(encoding="utf-8") != pj)
-    if need:
-        pj_file.write_text(pj, encoding="utf-8")
-        with console.status("[cyan]npm install (first run downloads Remotion, ~1-3 min)..."):
-            sh([npm, "install", "--no-audit", "--no-fund", "--loglevel=error"], cwd=root)
-        console.print("[green]installed[/]")
-    else:
-        console.print("[green]already installed[/]")
-    ffmpeg, ffprobe = find_tool("ffmpeg", root), find_tool("ffprobe", root)
+// palette: deep navy, muted brown, pale yellow, desaturated skin
+export const C = {
+  ink: '#05080f', n0: '#050914', n1: '#0b1530', n2: '#14264d', n3: '#22406f',
+  b0: '#241911', b1: '#43301f', b2: '#6a4d36', b3: '#8c6d4c',
+  yel: '#f2e3a0', yel2: '#cdb870', skin: '#b7a091', skinSh: '#8b766b', skinDk: '#5f504d',
+  hair: '#15121a', hood: '#26365a', hoodDk: '#18233d', white: '#d9d3c2',
+};
 
-    # 3 ---- audio analysis
-    step(3, "Audio analysis (speech envelope + pause map)")
-    with console.status("[cyan]decoding and measuring audio at 60 fps..."):
-        samples = decode_audio(audio, ffmpeg, root)
-        an = analyze_samples(samples, SR)
-    console.print(f"duration {an['dur']:.2f}s | speech {an['t0']:.2f}s -> {an['t1']:.2f}s | "
-                  f"pauses found {len(an['sil'])} | silence threshold {an['thr']:.3f}")
+const EV: Record<string, any[]> = {};
+for (const e of A.events) { (EV[e.type] = EV[e.type] || []).push(e); }
 
-    # 4 ---- alignment
-    step(4, "Scene alignment (audio-locked timeline)")
-    scenes = [(n, list(s_)) for n, s_ in SCENES]
-    if not TITLE_SPOKEN:
-        scenes[0] = (scenes[0][0], scenes[0][1][1:])
-    total, tl = build_timeline(an, scenes)
-    tb = Table(show_header=True, header_style="bold magenta")
-    for c in ("#", "scene", "start", "end", "length", "beats"):
-        tb.add_column(c)
-    for sc in tl:
-        tb.add_row(str(sc["id"]), sc["name"], f"{sc['start']/FPS:6.2f}s", f"{sc['end']/FPS:6.2f}s",
-                   f"{(sc['end']-sc['start'])/FPS:5.2f}s", str(len(sc["beats"])))
-    console.print(tb)
-    console.print(f"total {total} frames = {total/FPS:.3f}s (audio {an['dur']:.3f}s + {TAIL_SEC}s tail)")
+export const makeFx = (f: number) => {
+  const t = f / FPS; let i = 0;
+  for (let k = 0; k < A.scenes.length; k++) if (f >= A.scenes[k].start) i = k;
+  const sc = A.scenes[i]; const len = sc.end - sc.start; const lf = f - sc.start;
+  const env = A.env[Math.min(f, A.env.length - 1)];
+  const pulse = (type: string, decay = 0.25) => { let m = 0; for (const e of (EV[type] || [])) { const d = t - e.t; if (d >= 0) m = Math.max(m, Math.exp(-d / decay) * e.v); } return m; };
+  const within = (type: string) => { let m = 0; for (const e of (EV[type] || [])) if (t >= e.t && t <= e.t + e.dur) m = Math.max(m, e.v); return m; };
+  const since = (type: string) => { let r = -1; for (const e of (EV[type] || [])) if (t >= e.t) r = t - e.t; return r; };
+  return { f, t, i, lf, len, p: lf / Math.max(1, len), env, b: Math.floor(f / 5), pulse, within, since, sc };
+};
+export const Fx = React.createContext<any>(null);
+export const useFx = () => React.useContext(Fx);
 
-    # 5 ---- project
-    step(5, "Project build")
-    env = an["mouth"] + [0.0] * max(0, total - len(an["mouth"]))
-    data = {"fps": FPS, "totalFrames": total, "half": HALF, "tail": int(round(TAIL_SEC * FPS)), "audio": AUDIO_NAME,
-            "scenes": [{"id": s["id"], "from": s["from"], "to": s["to"], "beats": s["beats"]} for s in tl],
-            "env": env[:total]}
-    data_txt = json.dumps(data, separators=(",", ":"))
-    (root / "src" / "data.json").write_text(data_txt, encoding="utf-8")
-    for rel, txt in SOURCES.items():
-        (root / rel).write_text(txt, encoding="utf-8")
-    pub = root / "public" / AUDIO_NAME
-    if not pub.exists() or file_hash(pub) != file_hash(audio):
-        shutil.copyfile(audio, pub)
-    sig = hashlib.sha256((file_hash(audio) + data_txt + "".join(SOURCES.values()) +
-                          f"{CRF}{JPEG_Q}{CHUNK_FRAMES}").encode("utf-8")).hexdigest()
-    sig_file = cache / "signature.txt"
-    if args.fresh or not sig_file.exists() or sig_file.read_text().strip() != sig:
-        old = list(cache.glob("chunk_*.mp4"))
-        if old:
-            console.print(f"[yellow]inputs/code changed -> discarding {len(old)} cached chunk(s)[/]")
-        for p in cache.glob("*.mp4"):
-            p.unlink()
-        sig_file.write_text(sig)
-    for p in cache.glob("*.part.mp4"):
-        p.unlink()
-    ranges = [[s, min(s + CHUNK_FRAMES - 1, total - 1)] for s in range(0, total, CHUNK_FRAMES)]
-    done_frames = sum(r[1] - r[0] + 1 for i, r in enumerate(ranges) if (cache / f"chunk_{i:04d}.mp4").exists())
-    console.print(f"{len(ranges)} chunks of {CHUNK_FRAMES} frames | already rendered: {done_frames}/{total} frames")
+export const smoothPath = (pts: P[], closed = true) => {
+  const n = pts.length; const g = (i: number) => pts[closed ? (i + n) % n : Math.max(0, Math.min(n - 1, i))];
+  let d = 'M' + pts[0][0].toFixed(1) + ',' + pts[0][1].toFixed(1); const m = closed ? n : n - 1;
+  for (let i = 0; i < m; i++) {
+    const p0 = g(i - 1), p1 = g(i), p2 = g(i + 1), p3 = g(i + 2);
+    const c1 = [p1[0] + (p2[0] - p0[0]) / 6, p1[1] + (p2[1] - p0[1]) / 6], c2 = [p2[0] - (p3[0] - p1[0]) / 6, p2[1] - (p3[1] - p1[1]) / 6];
+    d += 'C' + c1[0].toFixed(1) + ',' + c1[1].toFixed(1) + ' ' + c2[0].toFixed(1) + ',' + c2[1].toFixed(1) + ' ' + p2[0].toFixed(1) + ',' + p2[1].toFixed(1);
+  }
+  return closed ? d + 'Z' : d;
+};
+export const ell = (cx: number, cy: number, rx: number, ry: number, n = 10, rot = 0): P[] => {
+  const out: P[] = []; const c = Math.cos(rot), s = Math.sin(rot);
+  for (let k = 0; k < n; k++) { const a = (k / n) * Math.PI * 2; const x = Math.cos(a) * rx, y = Math.sin(a) * ry; out.push([cx + x * c - y * s, cy + x * s + y * c]); }
+  return out;
+};
+export const box = (x: number, y: number, w: number, h: number): P[] => [[x, y], [x + w / 2, y], [x + w, y], [x + w, y + h / 2], [x + w, y + h], [x + w / 2, y + h], [x, y + h], [x, y + h / 2]];
 
-    job = {"root": str(root), "cache": str(cache), "ranges": ranges, "crf": CRF, "jpegQuality": JPEG_Q,
-           "concurrency": max(2, min(8, (os.cpu_count() or 4) // 2)), "mode": "video"}
-    if args.stills:
-        sd = OUT_DIR / "stills"
-        sd.mkdir(exist_ok=True)
-        job.update(mode="stills", stillsDir=str(sd),
-                   stills=[min(total - 1, int((s["start"] + s["end"]) / 2)) for s in tl])
-    job_file = root / "job.json"
-    job_file.write_text(json.dumps(job), encoding="utf-8")
+// hand-drawn "boiling" line: every shape re-wobbles at 12 fps like traditional frame-by-frame animation
+export const Ink: React.FC<any> = ({ pts, fill = 'none', stroke = C.ink, sw = 6, seed = 0, amp = 2, closed = true, smooth = true, op = 1, blend, dash }) => {
+  const { b } = useFx();
+  const q: P[] = pts.map((p: P, i: number) => [p[0] + (hash(i * 3.1 + seed * 7.7 + b * 13.3) - 0.5) * 2 * amp, p[1] + (hash(i * 5.3 + seed * 3.3 + b * 17.9 + 50) - 0.5) * 2 * amp] as P);
+  const d = smooth ? smoothPath(q, closed) : 'M' + q.map((p) => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join('L') + (closed ? 'Z' : '');
+  return <path d={d} fill={fill} stroke={stroke} strokeWidth={sw} strokeLinejoin="round" strokeLinecap="round" opacity={op} strokeDasharray={dash} style={blend ? { mixBlendMode: blend } : undefined} />;
+};
 
-    # 6 ---- render
-    step(6, "Rendering stills" if args.stills else "Rendering (resumable)")
-    log = open(root / "render.log", "a", encoding="utf-8")
-    prog = Progress(SpinnerColumn(), TextColumn("[bold]{task.description}"), BarColumn(bar_width=None),
-                    TaskProgressColumn(), TextColumn("{task.completed}/{task.total}"),
-                    TimeElapsedColumn(), TimeRemainingColumn(), console=console, refresh_per_second=8)
-    proc = subprocess.Popen([node, "render.cjs", str(job_file)], cwd=root, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", bufsize=1)
-    t_bundle = prog.add_task("Bundling project", total=100)
-    t_main = prog.add_task("Rendering", total=(len(job.get("stills", [])) or total), completed=0 if args.stills else done_frames, visible=False)
-    t_start, session = time.time(), 0
-    cur_n, base = 0, done_frames
-    try:
-        with prog:
-            for line in proc.stdout:
-                line = line.rstrip()
-                if not line.startswith("@@"):
-                    log.write(line + "\n")
-                    continue
-                ev = json.loads(line[2:])
-                t = ev["t"]
-                if t == "bundle":
-                    prog.update(t_bundle, completed=ev["p"])
-                elif t == "stage":
-                    if ev["m"] == "browser":
-                        prog.update(t_bundle, description="Preparing headless Chrome (first run downloads it)")
-                    if ev["m"] == "render":
-                        prog.update(t_bundle, completed=100, visible=False)
-                        prog.update(t_main, visible=True)
-                elif t == "skip":
-                    prog.update(t_main, description=f"Chunk {ev['i']+1}/{len(ranges)} cached")
-                elif t == "start":
-                    cur_n = ev["n"]
-                    prog.update(t_main, description=f"Chunk {ev['i']+1}/{len(ranges)}")
-                elif t == "prog":
-                    fr_now = base + ev["rf"]
-                    el = max(1e-3, time.time() - t_start)
-                    prog.update(t_main, completed=fr_now,
-                                description=f"Chunk {ev['i']+1}/{len(ranges)} | {(session + ev['rf'])/el:.1f} fps")
-                elif t == "done":
-                    base += ev["n"]
-                    session += ev["n"]
-                    prog.update(t_main, completed=base)
-                elif t == "still":
-                    prog.update(t_main, completed=ev["i"] + 1, description=f"Still {ev['i']+1}/{ev['n']}")
-                elif t == "error":
-                    log.write(ev["m"] + "\n")
-                    prog.stop()
-                    die("render failed:\n" + ev["m"][-2500:])
-        proc.wait()
-    except KeyboardInterrupt:
-        proc.kill()
-        console.print("\n[yellow]Interrupted. Finished chunks are saved; run the script again to resume.[/]")
-        sys.exit(130)
-    log.close()
-    if proc.returncode != 0:
-        die(f"renderer exited with code {proc.returncode}; see {root / 'render.log'}")
-    if args.stills:
-        console.print(f"[green]stills saved to {OUT_DIR / 'stills'}[/]")
-        return
+export const Glow: React.FC<any> = ({ id, x, y, r, color = '242,227,160', a = 0.5, sx = 1, sy = 1, blend = 'screen' }) => (
+  <g style={{ mixBlendMode: blend }}>
+    <defs><radialGradient id={id} cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stopColor={'rgb(' + color + ')'} stopOpacity={a} />
+      <stop offset="45%" stopColor={'rgb(' + color + ')'} stopOpacity={a * 0.35} />
+      <stop offset="100%" stopColor={'rgb(' + color + ')'} stopOpacity={0} />
+    </radialGradient></defs>
+    <ellipse cx={x} cy={y} rx={r * sx} ry={r * sy} fill={'url(#' + id + ')'} />
+  </g>
+);
+export const Dark: React.FC<any> = ({ id = 'dk', x = 540, y = 960, r = 1300, a = 0.8, inner = 0.25 }) => (
+  <g>
+    <defs><radialGradient id={id} cx={x} cy={y} r={r} gradientUnits="userSpaceOnUse">
+      <stop offset={inner} stopColor="#04070f" stopOpacity={0} /><stop offset="1" stopColor="#04070f" stopOpacity={a} />
+    </radialGradient></defs>
+    <rect width="1080" height="1920" fill={'url(#' + id + ')'} />
+  </g>
+);
+export const Dust: React.FC<any> = ({ n = 30, x0 = 0, y0 = 0, w = 1080, h = 1920, color = C.yel, a = 0.5, seed = 1, vy = -14, op = 1 }) => {
+  const { t } = useFx(); const els: any[] = [];
+  for (let k = 0; k < n; k++) {
+    const px = x0 + (((hash(k + seed) * w + noise(t * 0.4 + k, seed) * 40) % w) + w) % w;
+    const py = y0 + (((hash(k * 7 + seed) * h + t * vy * (0.5 + hash(k))) % h) + h) % h;
+    els.push(<circle key={k} cx={px} cy={py} r={0.8 + hash(k * 5) * 2.4} fill={color} opacity={a * op * (0.3 + 0.7 * hash(k * 9 + Math.floor(t * 2)))} />);
+  }
+  return <g>{els}</g>;
+};
+export const Shadow: React.FC<any> = ({ dx = 0, dy = 0, sk = -20, sc = 1, op = 0.45, ox = 540, oy = 1200, children }) => (
+  <g opacity={op} filter="url(#bl6)" transform={'translate(' + dx + ',' + dy + ') translate(' + ox + ',' + oy + ') skewX(' + sk + ') scale(' + sc + ') translate(' + (-ox) + ',' + (-oy) + ')'}>{children}</g>
+);
 
-    # 7 ---- assemble
-    step(7, "Assemble, mux original audio, verify")
-    chunks = [cache / f"chunk_{i:04d}.mp4" for i in range(len(ranges))]
-    missing = [c.name for c in chunks if not c.exists()]
-    if missing:
-        die(f"missing chunks: {missing[:3]} ... rerun to resume")
-    lst = cache / "concat.txt"
-    lst.write_text("".join("file '" + c.as_posix().replace("'", "'\\''") + "'\n" for c in chunks), encoding="utf-8")
-    cmd = ffmpeg + ["-y", "-v", "error", "-progress", "pipe:1", "-nostats", "-f", "concat", "-safe", "0", "-i", str(lst),
-                    "-i", str(audio), "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "320k",
-                    "-af", "aresample=async=1:first_pts=0", "-movflags", "+faststart", str(final)]
-    with Progress(SpinnerColumn(), TextColumn("[bold]Muxing"), BarColumn(bar_width=None), TaskProgressColumn(),
-                  console=console) as p2:
-        tk = p2.add_task("mux", total=100)
-        mp = subprocess.Popen(cmd, cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                              encoding="utf-8", errors="replace")
-        tail = []
-        for ln in mp.stdout:
-            ln = ln.strip()
-            if ln.startswith(("out_time_us=", "out_time_ms=")):
-                try:
-                    p2.update(tk, completed=min(100, int(ln.split("=")[1]) / 1e6 / (total / FPS) * 100))
-                except ValueError:
-                    pass
-            elif "=" not in ln:
-                tail.append(ln)
-        mp.wait()
-        p2.update(tk, completed=100)
-    if mp.returncode != 0:
-        die("ffmpeg mux failed:\n" + "\n".join(tail[-15:]))
+// ----------------------------------------------------------------------------- the phone
+export const PhoneUI: React.FC<any> = ({ x, y, w = 190, h = 330, mode = 'dark' }) => {
+  const { p, t } = useFx();
+  const bub = (key: string, side: number, yy: number, fw: number, show: number) => {
+    if (p < show) return null; const k = ease((p - show) / 0.04); const bw = w * fw;
+    return (<g key={key} opacity={k} transform={'translate(0,' + (1 - k) * 8 + ')'}>
+      <Ink pts={box(side > 0 ? w - 14 - bw : 14, yy, bw, h * 0.085)} fill={side > 0 ? C.yel2 : '#2b3a5e'} stroke="none" amp={0.5} seed={yy} />
+      <rect x={(side > 0 ? w - 14 - bw : 14) + 8} y={yy + h * 0.028} width={bw * 0.7} height={h * 0.012} rx={2} fill={C.ink} opacity={0.45} />
+      {side > 0 && <rect x={w - 14 - bw + bw * 0.62} y={yy + h * 0.06} width={bw * 0.28} height={h * 0.008} rx={2} fill={C.ink} opacity={0.5} />}
+    </g>);
+  };
+  const dots = (yy: number) => [0, 1, 2].map((k) => <circle key={k} cx={26 + k * 11} cy={yy} r={3.4} fill="#7c8fb6" opacity={0.4 + 0.6 * Math.max(0, Math.sin(t * 8 - k * 0.9))} />);
+  const flash = Math.floor(t * 5) % 2;
+  let screen: any = null;
+  if (mode === 'alert') {
+    screen = (<g>
+      <rect x={10} y={20} width={w - 20} height={h - 40} rx={10} fill={flash ? '#e8dc98' : '#2a2415'} />
+      <Ink pts={[[w / 2, h * 0.28], [w * 0.2, h * 0.64], [w * 0.8, h * 0.64]]} fill={flash ? C.ink : C.yel} stroke="none" amp={0.8} seed={4} />
+      <rect x={w / 2 - 4} y={h * 0.42} width={8} height={h * 0.1} rx={3} fill={flash ? C.yel : C.ink} />
+      <circle cx={w / 2} cy={h * 0.575} r={5} fill={flash ? C.yel : C.ink} />
+    </g>);
+  } else if (mode !== 'dark') {
+    const a = mode === 'chat' ? [[1, .10, .62], [1, .28, .45]] : mode === 'chat2' ? [[1, .08, .74]] : [[1, .08, .6], [1, .30, .5], [1, .52, .7]];
+    screen = (<g>
+      <rect x={10} y={20} width={w - 20} height={h - 40} rx={10} fill="#0d1425" />
+      <rect x={10} y={20} width={w - 20} height={h * 0.1} rx={10} fill="#18223b" />
+      <circle cx={30} cy={20 + h * 0.05} r={h * 0.028} fill={C.skinSh} /><rect x={52} y={20 + h * 0.035} width={w * 0.32} height={5} rx={2} fill="#7c8fb6" opacity={0.7} />
+      {a.map((m: number[], k: number) => bub('o' + k, 1, h * (0.2 + k * 0.13), m[2], m[1]))}
+      {mode === 'chat' && (p > 0.42 && p < 0.62 ? dots(h * 0.46) : null)}
+      {mode === 'chat' && bub('i1', -1, h * 0.46, 0.5, 0.62)}
+      {mode === 'chat2' && bub('i2', -1, h * 0.34, 0.62, 0.46)}
+      {mode === 'chat2' && bub('i3', -1, h * 0.46, 0.4, 0.56)}
+      {mode === 'empty' && <g><circle cx={w - 24} cy={20 + h * 0.05} r={4} fill="#555" /><rect x={w - 70} y={h * 0.86} width={52} height={5} rx={2} fill="#7c8fb6" opacity={0.35} /></g>}
+    </g>);
+  }
+  return (<g transform={'translate(' + (x - w / 2) + ',' + y + ')'}>
+    <Ink pts={box(0, 0, w, h)} fill="#090c14" sw={7} seed={61} amp={1.2} />
+    {screen}
+  </g>);
+};
 
-    pr = subprocess.run(ffprobe + ["-v", "error", "-show_entries", "stream=codec_type,codec_name,width,height,r_frame_rate,duration",
-                                   "-of", "json", str(final)], cwd=root, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    try:
-        streams = json.loads(pr.stdout)["streams"]
-        v = next(s for s in streams if s["codec_type"] == "video")
-        a = next(s for s in streams if s["codec_type"] == "audio")
-        vd, ad = float(v.get("duration", 0)), float(a.get("duration", 0))
-        exp = total / FPS
-        ok = abs(vd - exp) < .05 and ad >= an["dur"] - .1
-        console.print(f"video {v['width']}x{v['height']} {v['r_frame_rate']} {v['codec_name']} {vd:.3f}s (expected {exp:.3f}s) | "
-                      f"audio {a['codec_name']} {ad:.3f}s (source {an['dur']:.3f}s) | sync check: "
-                      + ("[bold green]PASS[/]" if ok else "[bold red]CHECK[/]"))
-    except Exception:
-        console.print("[yellow]ffprobe verification skipped[/]")
-    console.print(Panel.fit(f"[bold green]Done[/]  {final}\nChunk cache kept in {cache}", border_style="green"))
+// ----------------------------------------------------------------------------- the character
+export const Character: React.FC<any> = (props) => {
+  const { x, y, s = 1, fear = 0.3, look = [0, 0], mouth = 'flat', hands = 'none', tilt = 0, lit = 0, litDir = -1, tint, seed = 1, phoneAt, sleep = 0, tears = 0, children } = props;
+  const { f, t, env } = useFx();
+  const trem = fear * 2.4 + env * 1.4;
+  const ox = noise(f * 0.8, seed) * trem, oy = noise(f * 0.8, seed + 4) * trem * 0.6;
+  const br = 1 + Math.sin(t * (1.5 + fear * 2.5)) * 0.012 * (1 + fear);
+  const bt = (t + seed * 1.3) % 3.9; const blinkRaw = bt < 0.14 ? Math.sin((bt / 0.14) * Math.PI) : 0;
+  const open = clamp(0.95 + fear * 0.5 - Math.max(blinkRaw, sleep) * 1.1, 0.05, 1.5);
+  const F = (c: string) => (tint ? tint : c);
+  const K = tint ? 'none' : C.ink;
+  const pr = Math.min(lerp(16, 7, clamp(fear)), 34 * open);
 
+  const eye = (sx: number) => {
+    const ex = sx * 47, ey = -205;
+    const lx = look[0] * 13 + noise(f * 0.35, seed + sx) * fear * 3, ly = look[1] * 10 + noise(f * 0.31, seed + 3 + sx) * fear * 3;
+    return (<g key={'e' + sx}>
+      <Ink pts={ell(ex, ey, 33, 37 * open, 10)} fill={F(C.white)} stroke={K} sw={5} seed={seed + sx + 10} amp={1.2} />
+      {open > 0.25 && !tint && <g>
+        <circle cx={ex + lx} cy={ey + ly * open} r={pr} fill="#0a0a10" />
+        <circle cx={ex + lx - pr * 0.35} cy={ey + ly * open - pr * 0.35} r={pr * 0.28} fill={C.yel} opacity={0.9} />
+      </g>}
+      {!tint && <Ink pts={[[ex - 36, ey - 4 * open], [ex, ey - 40 * open - 2], [ex + 36, ey - 4 * open]]} closed={false} stroke={C.skinDk} sw={7} seed={seed + sx + 20} amp={1} />}
+      {!tint && <Ink pts={[[ex - 28, -163], [ex, -152], [ex + 28, -163]]} closed={false} stroke={C.skinDk} sw={5} op={0.55} seed={seed + sx + 25} amp={0.8} />}
+    </g>);
+  };
+  const brow = (sx: number) => (<Ink key={'br' + sx} pts={[[sx * 84, -248 + fear * 10], [sx * 48, -266 - fear * 14], [sx * 14, -256 - fear * 26]]} closed={false} stroke={C.hair} sw={14} seed={seed + 30 + sx} amp={1.2} />);
+  const mY = -106; let mouthEl: any;
+  if (mouth === 'gasp') mouthEl = <Ink pts={ell(0, mY, 15 + fear * 6, 20 + env * 12 + fear * 6, 8)} fill="#1a0b0f" stroke={K} sw={5} seed={seed + 40} amp={0.8} />;
+  else if (mouth === 'open') mouthEl = <Ink pts={ell(0, mY, 28, 16 + env * 20, 8)} fill="#1a0b0f" stroke={K} sw={5} seed={seed + 40} amp={0.8} />;
+  else if (mouth === 'frown') mouthEl = <Ink pts={[[-36, -96], [0, -118], [36, -96]]} closed={false} stroke={K} sw={6} seed={seed + 40} amp={1} />;
+  else if (mouth === 'tremble') mouthEl = <Ink pts={[0, 1, 2, 3, 4, 5, 6].map((k) => [-34 + k * 11.3, mY + (k % 2 ? -4 : 4) * (0.6 + fear)] as P)} closed={false} smooth={false} stroke={K} sw={6} seed={seed + 40} amp={2} />;
+  else mouthEl = <Ink pts={[[-30, mY], [0, mY + 2], [30, mY - 2]]} closed={false} stroke={K} sw={6} seed={seed + 40} amp={1} />;
+
+  const arm = (ax: number, ay: number, bx: number, by: number, sd: number) => {
+    const dx = bx - ax, dy = by - ay, L = Math.hypot(dx, dy) || 1, nx = -dy / L, ny = dx / L; const bend = sd > 0 ? 14 : -14;
+    return <Ink key={'a' + sd} pts={[[ax + nx * 44, ay + ny * 44], [(ax + bx) / 2 + nx * 42 + bend, (ay + by) / 2 + ny * 42], [bx + nx * 36, by + ny * 36], [bx - nx * 36, by - ny * 36], [(ax + bx) / 2 - nx * 42 + bend, (ay + by) / 2 - ny * 42], [ax - nx * 44, ay - ny * 44]]} fill={F(C.hood)} stroke={K} sw={7} seed={sd + 50} amp={2} />;
+  };
+  const hand = (hx: number, hy: number, rot: number, sc: number, sd: number) => (
+    <g key={'h' + sd} transform={'translate(' + hx + ',' + hy + ') rotate(' + rot + ') scale(' + sc + ')'}>
+      {[0, 1, 2, 3].map((k) => <Ink key={k} pts={ell((k - 1.5) * 21, -44 - (k === 1 || k === 2 ? 8 : 0), 10.5, 27, 7)} fill={F(C.skin)} stroke={K} sw={5} seed={sd + k + 1} amp={1} />)}
+      <Ink pts={ell(0, 0, 40, 36, 9)} fill={F(C.skin)} stroke={K} sw={5} seed={sd} amp={1.2} />
+      <Ink pts={ell(-46, -6, 12, 26, 7, -0.7)} fill={F(C.skin)} stroke={K} sw={5} seed={sd + 9} amp={1} />
+    </g>
+  );
+  let hp: number[][] = [];
+  if (hands === 'ears') hp = [[-172, -190, -8], [172, -190, 8]];
+  else if (hands === 'mouth') hp = [[22, -108, 0], [-70, 160, 10]];
+  else if (hands === 'phone') hp = phoneAt || [[-100, 178, -12], [100, 178, 12]];
+  else if (hands === 'hug') hp = [[-80, 190, -70], [80, 190, 70]];
+  const sd = -litDir || 1;
+
+  return (
+    <g transform={'translate(' + (x + ox) + ',' + (y + oy) + ') scale(' + s + ',' + s * br + ')'}>
+      <Ink pts={[[-270, 440], [-275, 170], [-225, 40], [-120, -22], [0, -34], [120, -22], [225, 40], [275, 170], [270, 440]]} fill={F(C.hood)} stroke={K} sw={7} seed={seed + 1} amp={2.5} />
+      <Ink pts={ell(0, -28, 118, 36, 10)} fill={F(C.hoodDk)} stroke={K} sw={6} seed={seed + 2} amp={1.5} />
+      {!tint && <Ink pts={[[-30, -6], [-34, 80]]} closed={false} smooth={false} stroke={C.hoodDk} sw={6} seed={seed + 3} amp={1} />}
+      {!tint && <Ink pts={[[30, -6], [34, 90]]} closed={false} smooth={false} stroke={C.hoodDk} sw={6} seed={seed + 4} amp={1} />}
+      {hands !== 'none' && hands !== 'ears' && hp.map((h, k) => arm(k ? 215 : -215, 40, h[0] * 0.8 + (k ? 40 : -40) * 0.2, h[1] + 36, k ? 1 : -1))}
+      {hands === 'ears' && hp.map((h, k) => arm(k ? 215 : -215, 40, h[0], h[1] + 70, k ? 1 : -1))}
+      <Ink pts={box(-46, -96, 92, 80)} fill={F(C.skinSh)} stroke={K} sw={6} seed={seed + 5} amp={1.5} />
+      <g transform={'rotate(' + tilt + ' 0 -50)'}>
+        <Ink pts={ell(0, -218, 132, 148, 12)} fill={F(C.hair)} stroke={K} sw={7} seed={seed + 6} amp={2} />
+        <Ink pts={ell(-112, -195, 20, 32, 8)} fill={F(C.skinSh)} stroke={K} sw={5} seed={seed + 7} amp={1} />
+        <Ink pts={ell(112, -195, 20, 32, 8)} fill={F(C.skinSh)} stroke={K} sw={5} seed={seed + 8} amp={1} />
+        <Ink pts={ell(0, -200, 112, 132, 12)} fill={F(C.skin)} stroke={K} sw={7} seed={seed + 9} amp={1.8} />
+        {!tint && <Ink pts={[[sd * 78, -318], [sd * 116, -230], [sd * 108, -120], [sd * 62, -76], [sd * 92, -170], [sd * 96, -250]]} fill={C.skinSh} stroke="none" op={0.6} seed={seed + 12} amp={1.5} />}
+        {!tint && lit > 0 && <Ink pts={ell(0, -148, 100, 80, 10)} fill={C.yel} stroke="none" op={0.3 * lit} blend="screen" seed={seed + 13} amp={1} />}
+        {!tint && lit > 0 && <Ink pts={[[litDir * 110, -270], [litDir * 118, -200], [litDir * 104, -130]]} closed={false} stroke={C.yel} sw={6} op={0.55 * lit} seed={seed + 14} amp={1} />}
+        {!tint && eye(-1)}{!tint && eye(1)}{!tint && brow(-1)}{!tint && brow(1)}
+        {tint && <g />}
+        {!tint && <Ink pts={[[-4, -196], [-12, -160], [6, -155]]} closed={false} stroke={C.skinDk} sw={5} seed={seed + 15} amp={0.8} />}
+        {!tint && mouthEl}
+        {!tint && tears > 0 && [-1, 1].map((q) => <Ink key={'t' + q} pts={[[q * 46, -168], [q * 52, -168 + 40 * tears], [q * 50, -168 + 80 * tears]]} closed={false} stroke="#9fb3c8" sw={5} op={0.7} seed={seed + 16 + q} amp={1} />)}
+        {!tint && fear > 0.45 && [0, 1, 2].map((k) => { const ph = (t * 0.35 + k * 0.37 + seed * 0.1) % 1; const dx = [-86, 92, -60][k], dy = -300 + ph * 150;
+          return <Ink key={'s' + k} pts={[[dx, dy - 14], [dx + 8, dy + 4], [dx, dy + 12], [dx - 8, dy + 4]]} fill="#aab8c8" stroke="none" op={0.6 * (1 - ph) * clamp((fear - 0.4) * 3)} seed={k} amp={0.5} />; })}
+        <Ink pts={[[-118, -215], [-100, -310], [-40, -345], [40, -345], [105, -300], [118, -215], [80, -262], [30, -272], [-20, -288], [-70, -255]]} fill={F(C.hair)} stroke={K} sw={6} seed={seed + 17} amp={2} />
+      </g>
+      {children}
+      {hp.map((h, k) => hand(h[0], h[1], h[2], hands === 'mouth' && k === 0 ? 1.25 : 1, k * 7 + 3))}
+    </g>
+  );
+};
+'''
+FILES["src/shots.tsx"] = r'''import React from 'react';
+import { A, C, Ink, Glow, Dark, Dust, Shadow, PhoneUI, Character, useFx, clamp, lerp, ease, hash, noise, ell, box, P } from './lib';
+
+const lines = (n: number, f: (k: number) => any) => { const o: any[] = []; for (let k = 0; k < n; k++) o.push(f(k)); return o; };
+
+// ============================================================ bedroom (scenes 0-2)
+export const Bed: React.FC<any> = ({ cfg }) => {
+  const { t, f, p, i, env, pulse, within, since } = useFx();
+  const off = since('lampoff') >= 0;
+  const lamp = off ? clamp(1 - since('lampoff') * 9) : (0.82 + 0.18 * noise(f * 0.3, 3)) * (1 - 0.4 * pulse('alert', 0.5) * Math.abs(Math.sin(t * 13)));
+  const sleep = i === 0 ? clamp(1 - (t - 0.8) * 3) : 0;
+  const fear = lerp(cfg.fear[0], cfg.fear[1], p) + env * 0.1;
+  const screenOn = i >= 1 || within('alert') > 0;
+  const glow = (off ? 1 : 0.65) * (screenOn ? 0.7 + 0.3 * (Math.floor(t * 5) % 2) : 0.08);
+  const chr = (props: any) => <Character x={540} y={1130} s={1.45} fear={fear} look={[0, 0.7]} mouth={fear > 0.6 ? 'tremble' : 'flat'} hands="phone" phoneAt={[[-70, 185, -10], [70, 185, 10]]} sleep={sleep} tilt={sleep * 6} lit={0.5 + glow * 0.4} litDir={-1} {...props}>
+    <PhoneUI x={0} y={95} w={150} h={270} mode={screenOn ? 'alert' : 'dark'} />
+  </Character>;
+  return (<g>
+    <rect width="1080" height="1500" fill={C.n1} />
+    {lines(10, (k) => <Ink key={k} pts={[[k * 120 + 20, 0], [k * 120 + 22, 1180]]} closed={false} smooth={false} stroke={C.n2} sw={26} op={0.28} amp={1.5} seed={k} />)}
+    <rect y="1170" width="1080" height="340" fill={C.b0} />
+    <Ink pts={box(0, 1160, 1080, 26)} smooth={false} fill={C.b1} sw={4} seed={3} amp={1} />
+    {lines(6, (k) => <Ink key={'p' + k} pts={box(30 + k * 180, 1215, 150, 240)} smooth={false} fill="none" stroke={C.b1} sw={5} seed={k + 5} amp={1.5} />)}
+    <rect y="1500" width="1080" height="420" fill="#1a120c" />
+    {lines(7, (k) => <Ink key={'f' + k} pts={[[0, 1540 + k * 58], [1080, 1544 + k * 58]]} closed={false} smooth={false} stroke={C.b0} sw={4} op={0.7} amp={2} seed={k + 20} />)}
+    {/* window with drawn curtains */}
+    <Ink pts={box(70, 250, 290, 580)} smooth={false} fill="#1b2f58" stroke={C.b2} sw={22} seed={30} amp={1.5} />
+    <Ink pts={[[78, 256], [210, 256], [214, 600], [190, 830], [78, 830]]} fill={C.b1} sw={6} seed={31} amp={2} />
+    <Ink pts={[[352, 256], [222, 256], [216, 600], [240, 830], [352, 830]]} fill={C.b1} sw={6} seed={32} amp={2} />
+    {lines(5, (k) => <Ink key={'c' + k} pts={[[100 + k * 28, 270], [104 + k * 28, 800]]} closed={false} stroke={C.b0} sw={5} op={0.7} seed={k + 33} amp={2} />)}
+    {/* wardrobe */}
+    <Shadow dx={90} dy={0} sk={-8} sc={1.0} op={0.35} ox={900} oy={1500}><rect x={780} y={380} width={260} height={1120} fill="#000" /></Shadow>
+    <Ink pts={box(780, 380, 270, 1120)} smooth={false} fill={C.b1} stroke={C.ink} sw={8} seed={40} amp={2} />
+    <Ink pts={box(770, 350, 290, 44)} smooth={false} fill={C.b2} sw={7} seed={41} amp={1.5} />
+    <Ink pts={box(800, 430, 105, 980)} smooth={false} fill="none" stroke={C.b0} sw={7} seed={42} amp={2} />
+    <Ink pts={box(925, 430, 105, 980)} smooth={false} fill="none" stroke={C.b0} sw={7} seed={43} amp={2} />
+    <circle cx={905} cy={900} r={12} fill={C.yel2} /><circle cx={925} cy={900} r={12} fill={C.yel2} />
+    {/* pictures */}
+    <g transform="rotate(-3 550 450)"><Ink pts={box(450, 350, 190, 200)} smooth={false} fill={C.n0} stroke={C.b2} sw={14} seed={44} amp={1.5} />
+      <Ink pts={[[460, 530], [520, 450], [560, 500], [600, 430], [632, 530]]} fill={C.n2} stroke="none" seed={45} /></g>
+    {/* bed */}
+    <Ink pts={[[200, 1500], [200, 980], [330, 870], [540, 840], [750, 870], [880, 980], [880, 1500]]} fill={C.b2} stroke={C.ink} sw={9} seed={46} amp={2} />
+    <Ink pts={ell(380, 1050, 150, 90, 10)} fill="#7a766c" sw={7} seed={47} amp={2} />
+    <Ink pts={ell(700, 1050, 150, 90, 10)} fill="#7a766c" sw={7} seed={48} amp={2} />
+    {/* long shadow of the character thrown by the lamp */}
+    <Shadow dx={330} dy={-120} sk={-22} sc={1.25} op={0.45} ox={540} oy={1300}>{chr({ tint: '#02040a', hands: 'none', children: null })}</Shadow>
+    {chr({})}
+    {/* blanket */}
+    <Ink pts={[[100, 1470], [300, 1440], [540, 1460], [780, 1440], [980, 1470], [1080, 1560], [1080, 1920], [0, 1920], [0, 1560]]} fill={C.b1} stroke={C.ink} sw={9} seed={49} amp={3} />
+    {lines(5, (k) => <Ink key={'w' + k} pts={[[120 + k * 200, 1560], [150 + k * 200, 1740], [110 + k * 200, 1900]]} closed={false} stroke={C.b0} sw={6} op={0.8} seed={k + 50} amp={3} />)}
+    {/* night lamp + table */}
+    <Ink pts={box(60, 1250, 230, 300)} smooth={false} fill={C.b1} stroke={C.ink} sw={8} seed={60} amp={2} />
+    <Ink pts={box(80, 1330, 190, 90)} smooth={false} fill={C.b2} stroke={C.ink} sw={6} seed={61} amp={1.5} />
+    <Ink pts={[[178, 1250], [182, 1140]]} closed={false} stroke={C.ink} sw={10} seed={62} amp={1} />
+    <Ink pts={[[112, 1050], [250, 1050], [292, 1175], [70, 1175]]} fill={off ? '#2a2318' : C.yel} stroke={C.ink} sw={7} op={1} seed={63} amp={1.5} />
+    <Dark x={540} y={1150} r={1450} a={0.82 - env * 0.05} />
+    <Glow id="g1" x={180} y={1130} r={900} a={0.6 * lamp} />
+    <Glow id="g2" x={540} y={1380} r={560} a={0.5 * glow} color="225,232,255" />
+    <Dust n={34} x0={150} y0={700} w={700} h={800} a={0.5 * (0.3 + lamp)} seed={3} />
+  </g>);
+};
+
+// ============================================================ close-up face (scenes 3,5,6,12,14)
+export const Face: React.FC<any> = ({ cfg }) => {
+  const { t, f, p, env, pulse } = useFx();
+  const fear = clamp(lerp(cfg.fear[0], cfg.fear[1], p) + env * 0.12);
+  const mouth = p < (cfg.sw || 0.5) ? cfg.mouth : (cfg.mouth2 || cfg.mouth);
+  const glow = 0.8 + 0.2 * noise(f * 0.25, 2);
+  const hands = cfg.hands === 'mouthLate' ? (p > 0.82 ? 'mouth' : 'none') : cfg.hands;
+  const ch = (props: any) => <Character x={540} y={1180} s={2.7} fear={fear} look={cfg.look(p, t)} mouth={mouth} hands={hands} phoneAt={[[-110, 235, -10], [110, 235, 10]]} lit={cfg.lit} litDir={cfg.litDir || 0} tears={cfg.tears ? clamp((p - 0.3) * 2) : 0} tilt={cfg.tilt || 0} {...props}>
+    {cfg.phone && <PhoneUI x={0} y={60} w={190} h={330} mode={cfg.phone} />}
+  </Character>;
+  return (<g>
+    <rect width="1080" height="1920" fill={C.n1} />
+    {lines(7, (k) => <Ink key={k} pts={box(k * 165 - 20, -20, 150, 1960)} smooth={false} fill={C.b0} stroke={C.n0} sw={6} op={0.8} seed={k} amp={2} />)}
+    <Shadow dx={260} dy={-260} sk={-8} sc={1.5} op={0.6} ox={540} oy={1180}>{ch({ tint: '#02040a', hands: 'none', children: null })}</Shadow>
+    {ch({})}
+    <Dark x={540} y={900} r={1350} a={0.86 - env * 0.06} inner={0.2} />
+    <Glow id="g3" x={540} y={cfg.phone ? 1500 : 1650} r={900} a={0.5 * glow * (cfg.phone ? 1 : 0.6)} color={cfg.phone ? '232,236,255' : '242,227,160'} />
+    <Dust n={26} x0={0} y0={200} w={1080} h={1400} a={0.35} seed={5} />
+  </g>);
+};
+
+// ============================================================ bathroom (scenes 4, 13)
+export const Bath: React.FC<any> = ({ cfg }) => {
+  const { t, f, p, env, pulse, within } = useFx();
+  const enter = cfg.mode === 'enter';
+  const fear = clamp(lerp(cfg.fear[0], cfg.fear[1], p) + env * 0.12);
+  const walk = enter ? ease(clamp(p / 0.38)) : 1;
+  const cx = enter ? lerp(1350, 540, walk) : 540;
+  const crouch = enter ? ease(clamp((p - 0.36) / 0.2)) : 1;
+  const bob = enter && p < 0.38 ? Math.abs(Math.sin(t * 7)) * 22 : 0;
+  const cy = lerp(1010, 1250, crouch) - bob;
+  const beam = 0.55 + 0.2 * noise(f * 0.2, 6) + 0.1 * env;
+  const doorX = enter ? lerp(1080, 880, clamp((p - 0.76) / 0.05)) : 1080;
+  const crack = cfg.mode === 'shake' ? clamp((p - 0.2) * 1.6) : 0;
+  const ch = (props: any) => <Character x={cx} y={cy} s={1.55} fear={fear} look={[-0.6, 0.2]} mouth={fear > 0.7 ? 'tremble' : 'flat'} hands={cfg.hands} lit={0.7} litDir={1} {...props}>
+    {cfg.hands === 'hug' && <Ink pts={ell(0, 175, 165, 100, 10)} fill="#8f8b7d" sw={7} seed={77} amp={2} />}
+  </Character>;
+  return (<g>
+    <rect width="1080" height="1500" fill="#13244a" />
+    {lines(9, (k) => <Ink key={'v' + k} pts={[[k * 135, 0], [k * 135 + 2, 1500]]} closed={false} smooth={false} stroke={C.n1} sw={4} amp={1.5} seed={k} />)}
+    {lines(12, (k) => <Ink key={'h' + k} pts={[[0, k * 130], [1080, k * 130 + 2]]} closed={false} smooth={false} stroke={C.n1} sw={4} amp={1.5} seed={k + 20} />)}
+    <rect y="1500" width="1080" height="420" fill={C.b0} />
+    {lines(8, (k) => <Ink key={'t' + k} pts={[[k * 150, 1500], [k * 150 - 60 + (k - 4) * 10, 1920]]} closed={false} smooth={false} stroke={C.n0} sw={5} op={0.6} amp={2} seed={k + 40} />)}
+    <Ink pts={box(560, 1170, 520, 330)} fill="#6e7890" sw={8} seed={51} amp={2} />
+    <Ink pts={box(560, 1150, 520, 40)} smooth={false} fill="#8d95a8" sw={6} seed={52} amp={1} />
+    <Ink pts={box(30, 980, 260, 40)} fill="#8d95a8" sw={7} seed={53} amp={1.5} />
+    <Ink pts={box(80, 1020, 150, 480)} fill="#7a8398" sw={7} seed={54} amp={2} />
+    <Ink pts={box(50, 520, 220, 330)} smooth={false} fill="#0a1228" stroke={C.b2} sw={12} seed={55} amp={1.5} />
+    {enter && p > 0.7 && <g opacity={0.5 + 0.4 * Math.sin(t * 3)}><circle cx={140} cy={640} r={7} fill={C.yel} /><circle cx={180} cy={640} r={7} fill={C.yel} /></g>}
+    {cfg.mode === 'shake' && <g opacity={crack}><Ink pts={[[700, 0], [640, 160], [700, 300], [610, 470], [660, 620], [590, 780]]} closed={false} smooth={false} stroke={C.ink} sw={7} amp={1.5} seed={71} />
+      <Ink pts={[[640, 160], [560, 230], [520, 330]]} closed={false} smooth={false} stroke={C.ink} sw={5} amp={1.5} seed={72} /></g>}
+    {/* torch on the floor: cone of pale light */}
+    <defs><linearGradient id="tc" gradientUnits="userSpaceOnUse" x1="820" y1="1600" x2="250" y2="1000"><stop offset="0" stopColor={C.yel} stopOpacity={0.7 * beam} /><stop offset="1" stopColor={C.yel} stopOpacity={0} /></linearGradient></defs>
+    <g filter="url(#bl18)" style={{ mixBlendMode: 'screen' }}><path d="M820,1600 L110,1050 L380,1480 Z" fill="url(#tc)" /></g>
+    <Ink pts={box(790, 1570, 110, 44)} fill={C.b3} sw={6} seed={73} amp={1} />
+    <Shadow dx={-420} dy={80} sk={22} sc={1.5} op={0.5} ox={cx} oy={1500}>{ch({ tint: '#02040a', hands: 'none', children: null })}</Shadow>
+    {ch({})}
+    {enter && <Ink pts={box(doorX, 0, 1080 - doorX + 20, 1500)} smooth={false} fill={C.b1} stroke={C.ink} sw={8} seed={74} amp={1.5} />}
+    <Dark x={540} y={1150} r={1250} a={0.84 - env * 0.05} />
+    <Glow id="g4" x={800} y={1590} r={640} a={0.55 * beam} />
+    <Dust n={cfg.mode === 'shake' ? 70 : 26} a={cfg.mode === 'shake' ? 0.7 : 0.4} color={cfg.mode === 'shake' ? '#9aa0ae' : C.yel} vy={cfg.mode === 'shake' ? 150 : -12} seed={9} op={cfg.mode === 'shake' ? 0.4 + within('rumble') : 1} />
+  </g>);
+};
+
+// ============================================================ the wall clock (scene 7)
+export const ClockShot: React.FC<any> = ({ cfg }) => {
+  const { t, f, p, env } = useFx();
+  const fear = lerp(cfg.fear[0], cfg.fear[1], p) + env * 0.1;
+  const min = ease(p) * 120, hr = 300 + ease(p) * 10, sec = ease(p) * 360 * 28;
+  const R = 330, cx = 540, cy = 800;
+  const hand = (ang: number, len: number, tail: number, w: number, col: string, sd: number) => {
+    const a = (ang - 90) * Math.PI / 180, ca = Math.cos(a), sa = Math.sin(a);
+    return <Ink key={sd} pts={[[cx - ca * tail, cy - sa * tail], [cx + ca * len, cy + sa * len]]} closed={false} smooth={false} stroke={col} sw={w} amp={0.8} seed={sd} />;
+  };
+  const phoneFlash = p > 0.9 ? Math.floor(t * 12) % 2 : 0;
+  return (<g>
+    <rect width="1080" height="1920" fill={C.n1} />
+    {lines(8, (k) => <Ink key={k} pts={[[k * 150, 0], [k * 150 + 3, 1500]]} closed={false} smooth={false} stroke={C.n2} sw={22} op={0.25} amp={1.5} seed={k} />)}
+    <rect y="1500" width="1080" height="420" fill="#1a120c" />
+    <Shadow dx={170} dy={90} sk={-12} sc={1.04} op={0.5} ox={cx} oy={cy}><Ink pts={ell(cx, cy, R + 24, R + 24, 18)} fill="#000" stroke="none" seed={8} /></Shadow>
+    <Ink pts={ell(cx, cy, R + 26, R + 26, 18)} fill={C.b2} sw={9} seed={80} amp={2.5} />
+    <Ink pts={ell(cx, cy, R, R, 18)} fill="#c9c0a0" sw={7} seed={81} amp={1.8} />
+    {lines(12, (k) => { const a = k * Math.PI / 6; const big = k % 3 === 0; return <Ink key={'k' + k} pts={[[cx + Math.sin(a) * R * (big ? 0.78 : 0.85), cy - Math.cos(a) * R * (big ? 0.78 : 0.85)], [cx + Math.sin(a) * R * 0.93, cy - Math.cos(a) * R * 0.93]]} closed={false} smooth={false} stroke={C.ink} sw={big ? 12 : 6} amp={1} seed={k + 82} />; })}
+    {hand(hr, 170, 30, 18, C.ink, 90)}{hand(min, 255, 36, 13, C.ink, 91)}{hand(sec, 285, 50, 5, '#8a3d36', 92)}
+    <circle cx={cx} cy={cy} r={16} fill={C.ink} />
+    <Ink pts={[[cx - 230, cy - 170], [cx - 150, cy - 250], [cx - 60, cy - 285]]} closed={false} stroke="#fff" sw={7} op={0.14} amp={1} seed={95} />
+    <Character x={230} y={1640} s={1.0} fear={fear} look={[0.3, -0.9]} mouth="tremble" hands="hug" lit={0.4} litDir={1} seed={3}>
+      <Ink pts={ell(0, 175, 165, 100, 10)} fill="#8f8b7d" sw={7} seed={96} amp={2} />
+    </Character>
+    <Dark x={540} y={800} r={1250} a={0.82 - env * 0.05} inner={0.3} />
+    <Glow id="g5" x={160} y={300} r={900} a={0.3 + 0.05 * noise(f * 0.2, 4)} />
+    <Glow id="g6" x={230} y={1500} r={380} a={0.35} />
+    {phoneFlash > 0 && <g><Ink pts={box(760, 1680, 110, 170)} fill="#e8dc98" sw={5} seed={97} /><Glow id="g7" x={815} y={1740} r={460} a={0.7} color="232,236,255" /></g>}
+    <Dust n={30} a={0.4} seed={7} />
+  </g>);
+};
+
+// ============================================================ the door (scenes 8, 9, 14b, 15)
+export const DoorShot: React.FC<any> = ({ cfg }) => {
+  const { t, f, p, env, pulse } = useFx();
+  const fear = clamp(lerp(cfg.fear[0], cfg.fear[1], p) + env * 0.1);
+  const kn = pulse('knock', 0.1), rat = pulse('rattle', 0.25);
+  const jx = noise(f * 2.1, 1) * 10 * kn + noise(f * 3, 2) * 3 * rat, jy = noise(f * 2.3, 3) * 5 * kn;
+  const lightA = 0.75 + 0.25 * noise(f * 0.2, 4);
+  const watched = cfg.watch && p > 0.55;
+  const legs: any[] = [];
+  const nL = cfg.mode === 'human' ? 2 : cfg.legs;
+  for (let k = 0; k < nL; k++) {
+    const human = cfg.mode === 'human';
+    const px = human ? 450 + k * 140 + noise(t * 0.5, k) * 6 : 260 + k * (cfg.legs > 2 ? 150 : 260) + noise(t * 0.25 + k * 3, k) * 90 + (Math.floor(t * 0.7 + k) % 2) * 60;
+    const w = human ? 62 : 22 + hash(k) * 14, tall = human ? 1 : 1.9;
+    legs.push(<g key={k}>
+      <Ink pts={[[px, 1472], [px + w, 1472], [px + w * (1.6 + tall * 0.6) + 20, 1760], [px - w * 0.5 + 20, 1760]]} fill={C.ink} stroke="none" op={0.55} amp={2} seed={k + 5} />
+      <Ink pts={box(px, 1450, w, 22)} smooth={false} fill={C.ink} stroke="none" amp={1} seed={k + 9} />
+    </g>);
+  }
+  const ch = (props: any) => <Character x={540} y={1990} s={1.3} fear={fear} look={[0, -0.9]} mouth={fear > 0.8 ? 'tremble' : 'flat'} hands={cfg.hands} lit={0.5} litDir={0} seed={4} tears={cfg.tears ? 0.8 : 0} {...props} />;
+  return (<g>
+    <rect width="1080" height="1920" fill={C.n1} />
+    <g transform={'translate(' + jx + ',' + jy + ')'}>
+      <Ink pts={box(150, 120, 780, 1350)} smooth={false} fill={C.b0} stroke={C.ink} sw={9} seed={100} amp={2} />
+      <Ink pts={box(190, 160, 700, 1290)} smooth={false} fill={C.b1} stroke={C.ink} sw={8} seed={101} amp={2} />
+      {[0, 1].map((c) => [0, 1, 2].map((r) => <g key={c + '-' + r}>
+        <Ink pts={box(250 + c * 360, [230, 650, 1070][r], 220, [340, 340, 320][r])} smooth={false} fill={C.b0} stroke={C.ink} sw={6} seed={c * 3 + r + 110} amp={1.8} />
+        <Ink pts={[[250 + c * 360, [230, 650, 1070][r] + 340], [250 + c * 360, [230, 650, 1070][r]], [470 + c * 360, [230, 650, 1070][r]]]} closed={false} smooth={false} stroke={C.b3} sw={4} op={0.5} seed={c * 3 + r + 120} amp={1} />
+      </g>))}
+      {lines(9, (k) => <Ink key={'g' + k} pts={[[205 + k * 77, 170], [210 + k * 77, 1440]]} closed={false} stroke={C.b0} sw={3} op={0.5} seed={k + 130} amp={2} />)}
+      <circle cx={540} cy={605} r={26} fill={C.yel2} stroke={C.ink} strokeWidth={5} />
+      <circle cx={540} cy={605} r={15} fill={watched ? '#050505' : C.yel} opacity={watched ? 1 : 0.4 + 0.3 * noise(f * 0.2, 2)} />
+      {watched && <ellipse cx={540} cy={605} rx={6} ry={9} fill="#cfd6c0" opacity={0.5 + 0.4 * Math.sin(t * 2)} />}
+      <circle cx={800} cy={760} r={28} fill={C.yel2} stroke={C.ink} strokeWidth={5} /><rect x={796} y={752} width={8} height={22} fill={C.ink} />
+      <g transform={'rotate(' + rat * 28 + ' 800 920)'}><Ink pts={ell(800, 920, 36, 36, 9)} fill={C.yel2} sw={6} seed={140} amp={1} /><circle cx={790} cy={910} r={9} fill="#f4ecc0" opacity={0.6} /></g>
+      <Ink pts={[[870, 430], [900, 470], [930, 430]]} closed={false} stroke={C.yel2} sw={5} seed={141} amp={1} />
+    </g>
+    <rect x={190} y={1450} width={700} height={22} fill={C.yel} opacity={lightA} />
+    <rect y="1472" width="1080" height="448" fill="#1a120c" />
+    <g filter="url(#bl18)" style={{ mixBlendMode: 'screen' }}><path d="M190,1472 L890,1472 L1060,1780 L20,1780 Z" fill={C.yel} opacity={0.35 * lightA} /></g>
+    {legs}
+    {ch({})}
+    <Dark x={540} y={1100} r={1350} a={0.87 - env * 0.05} inner={0.3} />
+    <Glow id="g8" x={540} y={1470} r={760} sy={0.55} a={0.55 * lightA} />
+    <Dust n={40} x0={150} y0={0} w={780} h={1450} a={0.5} vy={30} seed={11} op={0.2 + kn * 2} />
+  </g>);
+};
+
+// ============================================================ curtained window (scenes 10, 11)
+export const WindowShot: React.FC<any> = ({ cfg }) => {
+  const { t, f, p, env, pulse, within } = useFx();
+  const fear = clamp(lerp(cfg.fear[0], cfg.fear[1], p) + env * 0.12);
+  const sirenOn = within('siren') > 0 ? 1 : 0;
+  const beat = 0.5 + 0.5 * Math.sin(t * Math.PI * 2 / 2.2);
+  const alarm = within('caralarm') > 0 ? (Math.floor(t * 5) % 2) : 0;
+  const lightOut = clamp(0.22 + 0.35 * beat * sirenOn + 0.4 * alarm * 0.7 + 0.9 * pulse('crash', 0.18));
+  const figs: any[] = [];
+  for (let k = 0; k < cfg.figs; k++) {
+    const stop = cfg.stop && p > 0.62 && k === 0;
+    const x = stop ? lerp(300 + ((t * 18) % 600), 540, ease((p - 0.62) / 0.1)) : 240 + (((t * 16 + k * 330) % 720));
+    const hx = stop ? noise(t * 0.7, 3) * 30 : Math.sin(t * 1.3 + k) * 10;
+    figs.push(<g key={k} transform={'translate(' + x + ',1260)'} opacity={0.62}>
+      <Ink pts={[[-12, 0], [12, 0], [8, -560], [-8, -560]]} fill="#04040a" stroke="none" amp={2} seed={k + 150} />
+      <Ink pts={ell(hx, -640, 36, 62, 8, 0.2)} fill="#04040a" stroke="none" amp={2} seed={k + 160} />
+      <Ink pts={[[-6, -520], [-110, -250], [-120, -40]]} closed={false} stroke="#04040a" sw={11} amp={3} seed={k + 170} />
+      <Ink pts={[[6, -520], [100, -260], [130, -50]]} closed={false} stroke="#04040a" sw={11} amp={3} seed={k + 180} />
+    </g>);
+  }
+  return (<g>
+    <rect width="1080" height="1920" fill={C.n1} />
+    {lines(8, (k) => <Ink key={k} pts={[[k * 150, 0], [k * 150 + 3, 1340]]} closed={false} smooth={false} stroke={C.n2} sw={22} op={0.25} amp={1.5} seed={k} />)}
+    <rect y="1340" width="1080" height="580" fill="#1a120c" />
+    <Ink pts={box(150, 190, 780, 1110)} smooth={false} fill="#2a2118" stroke={C.b2} sw={30} seed={200} amp={2} />
+    <Ink pts={box(180, 220, 720, 1050)} smooth={false} fill="#34291d" stroke="none" seed={201} amp={2} />
+    <rect x={180} y={220} width={720} height={1050} fill={C.yel} opacity={lightOut * 0.55} style={{ mixBlendMode: 'screen' }} />
+    <g filter="url(#bl8)"><g clipPath="url(#win)">{figs}</g></g>
+    <defs><clipPath id="win"><rect x={180} y={220} width={720} height={1050} /></clipPath></defs>
+    {lines(14, (k) => <Ink key={'c' + k} pts={[[205 + k * 50, 230], [212 + k * 50, 760], [205 + k * 50, 1260]]} closed={false} stroke={C.b0} sw={5} op={0.65} amp={2.5} seed={k + 210} />)}
+    {lines(14, (k) => <Ink key={'l' + k} pts={[[225 + k * 50, 230], [232 + k * 50, 760], [225 + k * 50, 1260]]} closed={false} stroke={C.yel} sw={3} op={lightOut * 0.35} amp={2.5} seed={k + 230} />)}
+    <Ink pts={box(110, 1290, 860, 50)} smooth={false} fill={C.b2} stroke={C.ink} sw={7} seed={250} amp={1.5} />
+    {sirenOn > 0 && lines(3, (k) => { const ph = (t / 2.2 + k / 3) % 1; return <Ink key={'r' + k} pts={ell(540, 740, 220 + ph * 900, 220 + ph * 900, 26)} stroke={C.yel} sw={5} op={0.35 * (1 - ph)} amp={4} seed={k + 260} />; })}
+    <g filter="url(#bl18)" style={{ mixBlendMode: 'screen' }}><path d="M180,1340 L900,1340 L1080,1920 L0,1920 Z" fill={C.yel} opacity={lightOut * 0.22} /></g>
+    <Ink pts={[[535, 1340], [545, 1340], [620, 1920], [470, 1920]]} fill={C.ink} stroke="none" op={0.4} seed={270} amp={2} />
+    <Ink pts={[[180, 1520], [900, 1560], [900, 1620], [180, 1580]]} fill={C.ink} stroke="none" op={0.3} seed={271} amp={2} />
+    <Character x={250} y={1740} s={1.0} fear={fear} look={[0.7, -0.6]} mouth="tremble" hands="hug" lit={0.5 * lightOut} litDir={1} seed={5}>
+      <Ink pts={ell(0, 175, 165, 100, 10)} fill="#8f8b7d" sw={7} seed={96} amp={2} />
+    </Character>
+    <Dark x={540} y={800} r={1300} a={0.86 - env * 0.05 - lightOut * 0.25} inner={0.3} />
+    <Glow id="g9" x={540} y={760} r={640} a={0.5 * lightOut} />
+    <Dust n={30} a={0.4} seed={13} />
+  </g>);
+};
+'''
+FILES["src/scenes.ts"] = r'''// one entry per scene (same order as SCENES in make_video.py)
+const look = (x: number, y: number) => () => [x, y];
+export const SC: any[] = [
+  { shot: 'bed', z: [1.04, 1.12], o: [540, 880], shake: 0.4, fear: [0.1, 0.3] },
+  { shot: 'bed', z: [1.12, 1.22], o: [540, 880], shake: 0.7, fear: [0.4, 0.65] },
+  { shot: 'bed', z: [1.22, 1.36], o: [540, 880], shake: 0.9, fear: [0.65, 0.8] },
+  { shot: 'face', z: [1.04, 1.14], o: [540, 650], shake: 0.4, fear: [0.45, 0.55], phone: 'alert', hands: 'phone', lit: 0.7, mouth: 'flat', mouth2: 'frown', look: (p: number, t: number) => [Math.sin(t * 0.8) * 0.2, 0.8] },
+  { shot: 'bath', mode: 'enter', hands: 'hug', z: [1.04, 1.14], o: [540, 1000], shake: 0.8, fear: [0.5, 0.65] },
+  { shot: 'face', z: [1.06, 1.18], o: [540, 650], shake: 0.4, fear: [0.5, 0.65], phone: 'chat', hands: 'phone', lit: 0.8, mouth: 'flat', mouth2: 'frown', look: (p: number) => [0, 0.8] },
+  { shot: 'face', z: [1.18, 1.32], o: [540, 650], shake: 0.6, fear: [0.65, 0.88], phone: 'chat2', hands: 'phone', lit: 0.8, mouth: 'frown', mouth2: 'tremble', tears: true, look: (p: number, t: number) => [Math.sin(t * 2) * 0.3, 0.7] },
+  { shot: 'clock', z: [1.04, 1.18], o: [540, 800], shake: 0.5, fear: [0.6, 0.8] },
+  { shot: 'door', legs: 2, hands: 'mouth', z: [1.04, 1.14], o: [540, 1200], shake: 0.7, fear: [0.8, 0.92] },
+  { shot: 'door', legs: 4, watch: true, hands: 'mouth', tears: true, z: [1.14, 1.28], o: [540, 1300], shake: 0.8, fear: [0.9, 1.0] },
+  { shot: 'window', figs: 2, z: [1.04, 1.16], o: [540, 800], shake: 1.4, fear: [0.9, 1.0] },
+  { shot: 'window', figs: 3, stop: true, z: [1.16, 1.3], o: [540, 800], shake: 1.6, fear: [0.95, 1.0] },
+  { shot: 'face', z: [1.06, 1.2], o: [540, 650], shake: 0.9, fear: [0.8, 0.95], phone: 'empty', hands: 'phone', lit: 0.8, mouth: 'tremble', tears: true, look: (p: number, t: number) => [Math.sin(t * 3) * 0.2, 0.7] },
+  { shot: 'bath', mode: 'shake', hands: 'ears', z: [1.04, 1.2], o: [540, 1100], shake: 5, fear: [0.95, 1.0] },
+  { shot: 'face', z: [1.1, 1.3], o: [540, 640], shake: 0.9, fear: [0.85, 0.95], hands: 'mouthLate', lit: 0.6, litDir: -1, mouth: 'gasp', tears: true, look: (p: number) => [lerp0(-0.2, 1, p), 0] },
+  { shot: 'door', mode: 'human', legs: 2, hands: 'mouth', tears: true, watch: true, z: [1.06, 1.3], o: [540, 1000], shake: 0.9, fear: [0.9, 1.0] },
+];
+function lerp0(a: number, b: number, t: number) { return a + (b - a) * Math.min(1, t * 3); }
+'''
+FILES["src/Main.tsx"] = r'''import React from 'react';
+import { AbsoluteFill, Img, staticFile, useCurrentFrame } from 'remotion';
+import { A, Fx, makeFx, clamp, lerp, hash, noise } from './lib';
+import { Bed, Face, Bath, ClockShot, DoorShot, WindowShot } from './shots';
+import { SC } from './scenes';
+
+const SHOTS: any = { bed: Bed, face: Face, bath: Bath, clock: ClockShot, door: DoorShot, window: WindowShot };
+
+export const Main: React.FC = () => {
+  const f = useCurrentFrame();
+  const fx = makeFx(f);
+  const cfg = SC[Math.min(fx.i, SC.length - 1)];
+  const Shot = SHOTS[cfg.shot];
+  const sh = (cfg.shake || 0) + 14 * fx.pulse('knock', 0.1) + 16 * fx.pulse('crash', 0.35) + 9 * fx.within('rumble') + 8 * fx.pulse('bang', 0.3);
+  const z = lerp(cfg.z[0], cfg.z[1], fx.p) + 0.03 + 0.03 * fx.pulse('boom', 0.4) + 0.02 * fx.pulse('knock', 0.1);
+  const px = noise(f * 0.012, 1) * 5 + noise(f * 1.9, 2) * sh * 0.9;
+  const py = noise(f * 0.011, 3) * 5 + noise(f * 1.9, 4) * sh * 0.9;
+  const rot = noise(f * 1.3, 5) * sh * 0.04;
+  const last = fx.i === SC.length - 1;
+  const alpha = clamp(Math.min(fx.lf / (fx.i === 0 ? 30 : 9), (fx.len - fx.lf) / (last ? 150 : 7)));
+  const grainX = Math.floor(hash(f) * 256), grainY = Math.floor(hash(f + 77) * 256);
+  const pb = Math.floor(f / 5);
+  return (
+    <Fx.Provider value={fx}>
+      <AbsoluteFill style={{ background: '#02040a' }}>
+        <Img src={staticFile('grain.png')} style={{ display: 'none' }} />
+        <Img src={staticFile('paper.png')} style={{ display: 'none' }} />
+        <div style={{ position: 'absolute', inset: 0, opacity: alpha, transformOrigin: cfg.o[0] + 'px ' + cfg.o[1] + 'px', transform: 'translate(' + px + 'px,' + py + 'px) rotate(' + rot + 'deg) scale(' + z + ')' }}>
+          <svg width={1080} height={1920} viewBox="0 0 1080 1920">
+            <defs>
+              <filter id="bl6"><feGaussianBlur stdDeviation="6" /></filter>
+              <filter id="bl8"><feGaussianBlur stdDeviation="8" /></filter>
+              <filter id="bl18"><feGaussianBlur stdDeviation="18" /></filter>
+            </defs>
+            <Shot cfg={cfg} />
+          </svg>
+        </div>
+        <div style={{ position: 'absolute', inset: 0, background: 'radial-gradient(ellipse at 50% 48%, rgba(0,0,0,0) 36%, rgba(2,4,10,0.74) 100%)' }} />
+        <div style={{ position: 'absolute', inset: 0, backgroundImage: 'url(' + staticFile('paper.png') + ')', backgroundSize: '512px 512px', backgroundPosition: Math.floor(hash(pb) * 512) + 'px ' + Math.floor(hash(pb + 5) * 512) + 'px', mixBlendMode: 'soft-light', opacity: 0.35 }} />
+        <div style={{ position: 'absolute', inset: 0, backgroundImage: 'url(' + staticFile('grain.png') + ')', backgroundPosition: grainX + 'px ' + grainY + 'px', mixBlendMode: 'overlay', opacity: 0.24 }} />
+        <div style={{ position: 'absolute', inset: 0, background: '#000', opacity: 0.05 * (1 + noise(f * 0.6, 9)) }} />
+      </AbsoluteFill>
+    </Fx.Provider>
+  );
+};
+'''
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nStopped. Everything already rendered is saved - run the script again to resume.")
